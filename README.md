@@ -35,13 +35,21 @@ Run a workflow to inspect this repository and summarize the main modules.
 The model will write a workflow script and call the `workflow` tool. Live progress shows up inline:
 
 ```text
-◆ Workflow: inspect_project (3/3 done)
+◆ Workflow: inspect_project (3/3 done) · 42k tok in 31k out 11k $0.0842
   ✓ Scan 1/1
-    #1 ✓ repo inventory
+    #1 ✓ repo inventory · anthropic/claude-haiku-4-5 · low · done · 9.2k tok in 7.1k out 2.1k $0.0061
+      in: Inspect the repository structure and identify important entry points.
+      out: Main code is under src/, with extension entrypoint extensions/workflow.ts.
   ✓ Analyze 2/2
-    #2 ✓ source modules
-    #3 ✓ final summary
+    #2 ✓ source modules · anthropic/claude-sonnet-4-6 · medium · done · 18k tok in 14k out 4.0k $0.0310
+      out: The workflow runtime lives in src/workflow.ts and subagents run via src/agent.ts.
+    #3 ✓ final summary · anthropic/claude-opus-4-8 · high · done · 15k tok in 10k out 5.0k $0.0471
+      out: Prioritized findings include...
 ```
+
+While a workflow is running, each row can show the requested/resolved model, thinking level, current activity,
+tool/prompt/output previews, and token/cost totals as soon as Pi reports them. Token usage may show as pending
+while an agent is streaming and becomes exact after the agent finishes.
 
 Press `Esc` to cancel a running workflow. Active subagents are aborted and surfaced as skipped.
 
@@ -67,7 +75,12 @@ const inventory = await agent('Inspect the repository structure.', {
 phase('Analyze')
 const summary = await agent(
   'Summarize the main modules from this inventory:\n' + inventory,
-  { label: 'module summary' },
+  {
+    label: 'module summary',
+    model: 'anthropic/claude-sonnet-4-6',
+    thinkingLevel: 'medium',
+    isolation: { mode: 'worktree', dirty: 'ignore', merge: 'none' },
+  },
 )
 
 return { inventory, summary }
@@ -89,7 +102,7 @@ This declares `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `cwd`, an
 
 | Global | Description |
 | --- | --- |
-| `agent(prompt, opts)` | Spawn an isolated subagent. Returns its final text or, with `opts.schema`, a validated object. |
+| `agent(prompt, opts)` | Spawn a subagent. Returns its final text or, with `opts.schema`, a validated object. |
 | `parallel(thunks)` | Run an array of `() => agent(...)` thunks concurrently. Results are returned in input order. |
 | `pipeline(items, ...stages)` | Run each item through sequential stages while items fan out. Each stage receives `(prev, original, index)`. |
 | `phase(title)` | Mark the current phase. Used for grouping in the live progress view. |
@@ -98,16 +111,26 @@ This declares `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `cwd`, an
 | `cwd`, `process.cwd()` | Current working directory for subagents. |
 | `budget` | `{ total, spent(), remaining() }` token budget tracker. |
 
-### Determinism rules
+### Trust and isolation
 
-Workflow scripts are evaluated inside a Node `vm` sandbox. The following are intentionally unavailable:
+Workflow scripts are trusted orchestration code. Pi parses the first literal `meta` export for display and then runs the JavaScript under Pi's normal session/tool trust model.
 
-- `Date.now()`, `new Date()`
-- `Math.random()`
-- `require`, `import`, `fs`, network APIs
-- spreads, computed keys, template interpolation, function calls inside `meta`
+The workflow body can use normal JavaScript such as `Date.now()` and `Math.random()`. Static `import`, `require`, and direct `fs` access are still not part of the workflow surface; use subagents and Pi tools for project inspection.
 
-This keeps `meta` parseable, runs reproducible, and the surface area small.
+`meta` must stay literal: no spreads, computed keys, template interpolation, or function calls inside `meta`. This keeps upfront metadata parseable before the workflow runs.
+
+Subagents can opt into real Git worktree isolation:
+
+```js
+await agent('Audit src/lib/auth.ts for issues.', {
+  label: 'security audit',
+  model: 'anthropic/claude-sonnet-4-6',
+  thinkingLevel: 'high',
+  isolation: { mode: 'worktree', dirty: 'ignore', merge: 'none' },
+})
+```
+
+Worktree isolation creates a temporary Git worktree for that subagent, runs the Pi coding tools in that cwd, captures `git status --short` and `git diff --binary`, then removes the worktree unless `keep` says otherwise. Automatic merge-back is intentionally not implemented.
 
 ### Structured subagent output
 
@@ -134,9 +157,9 @@ Under the hood this is a Pi `structured_output` tool with `terminate: true`, so 
 ```text
 user prompt
   → Pi model writes a workflow script
-  → workflow tool parses + runs script in a vm sandbox
+  → workflow tool parses meta + runs trusted orchestration JavaScript
   → script calls agent(), parallel(), pipeline()
-  → each agent() spawns an in-memory Pi subagent session
+  → each agent() spawns an in-memory Pi subagent session, optionally in a Git worktree
   → snapshots stream back as compact progress
   → final structured result returned to the parent assistant
 ```
@@ -147,11 +170,13 @@ Subagents run in fresh in-memory Pi sessions with the standard coding tools, so 
 
 | File | Purpose |
 | --- | --- |
-| `src/workflow.ts` | AST-validated parser and sandboxed workflow runtime. |
+| `src/workflow.ts` | Literal metadata parser and trusted workflow runtime. |
 | `src/workflow-tool.ts` | The Pi `workflow` tool, prompt guidelines, rendering, abort handling. |
 | `src/agent.ts` | `WorkflowAgent`, an in-memory Pi subagent runner. |
+| `src/worktree.ts` | Opt-in Git worktree isolation for subagents. |
 | `src/structured-output.ts` | Terminating structured-output tool backed by TypeBox/JSON Schema. |
-| `src/display.ts` | Workflow snapshots and compact text renderers. |
+| `src/telemetry.ts` | Subagent event/stat summarizers for activity, previews, usage, and context. |
+| `src/display.ts` | Workflow snapshots and rich inline text renderers. |
 | `extensions/workflow.ts` | The Pi extension entrypoint. |
 
 ## Development
@@ -159,6 +184,7 @@ Subagents run in fresh in-memory Pi sessions with the standard coding tools, so 
 ```bash
 npm install
 npm test     # biome check + tsc + unit tests
+npm run test:e2e:fintrack  # opt-in live Pi model workflow test against /home/gustavo/fintrack
 npm run dev
 ```
 

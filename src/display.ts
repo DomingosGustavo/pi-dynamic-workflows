@@ -1,4 +1,14 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  WorkflowAgentActivity,
+  WorkflowAgentRunMetadata,
+  WorkflowContextUsage,
+  WorkflowModelRef,
+  WorkflowThinkingLevel,
+  WorkflowTokenUsage,
+  WorktreeIsolation,
+} from "./options.js";
+import { previewValue, sumWorkflowUsage } from "./telemetry.js";
 import type { WorkflowMeta } from "./workflow.js";
 
 export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
@@ -9,6 +19,15 @@ export interface WorkflowAgentSnapshot {
   phase?: string;
   prompt: string;
   status: WorkflowAgentStatus;
+  model?: WorkflowModelRef;
+  thinkingLevel?: WorkflowThinkingLevel;
+  isolation?: WorktreeIsolation;
+  metadata?: WorkflowAgentRunMetadata;
+  activity?: WorkflowAgentActivity;
+  usage?: WorkflowTokenUsage;
+  contextUsage?: WorkflowContextUsage;
+  promptPreview?: string;
+  outputPreview?: string;
   resultPreview?: string;
   error?: string;
 }
@@ -25,6 +44,7 @@ export interface WorkflowSnapshot {
   doneCount: number;
   errorCount: number;
   durationMs?: number;
+  usage?: WorkflowTokenUsage;
   result?: unknown;
 }
 
@@ -41,6 +61,11 @@ export interface WorkflowDisplayOptions {
   maxLogs?: number;
   showStatus?: boolean;
   showResultPreviews?: boolean;
+  showModel?: boolean;
+  showUsage?: boolean;
+  showActivity?: boolean;
+  showPreviews?: boolean;
+  previewWidth?: number;
 }
 
 export function createWorkflowSnapshot(meta: WorkflowMeta): WorkflowSnapshot {
@@ -61,7 +86,8 @@ export function recomputeWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowS
   const runningCount = snapshot.agents.filter((agent) => agent.status === "running").length;
   const doneCount = snapshot.agents.filter((agent) => agent.status === "done").length;
   const errorCount = snapshot.agents.filter((agent) => agent.status === "error").length;
-  return { ...snapshot, agentCount: snapshot.agents.length, runningCount, doneCount, errorCount };
+  const usage = sumWorkflowUsage(snapshot.agents.map((agent) => agent.usage ?? agent.metadata?.usage));
+  return { ...snapshot, agentCount: snapshot.agents.length, runningCount, doneCount, errorCount, usage };
 }
 
 export function createWidgetWorkflowDisplay(
@@ -129,13 +155,20 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
   const maxAgents = options.maxAgents ?? 8;
   const maxLogs = options.maxLogs ?? 2;
   const showResultPreviews = options.showResultPreviews ?? false;
+  const showModel = options.showModel ?? false;
+  const showUsage = options.showUsage ?? false;
+  const showActivity = options.showActivity ?? false;
+  const showPreviews = options.showPreviews ?? false;
   const state =
     snapshot.errorCount > 0
       ? `, ${snapshot.errorCount} errors`
       : snapshot.runningCount > 0
         ? `, ${snapshot.runningCount} running`
         : "";
-  const lines = [`◆ Workflow: ${snapshot.name} (${snapshot.doneCount}/${snapshot.agentCount} done${state})`];
+  const headerUsage = showUsage ? formatUsage(snapshot.usage) : undefined;
+  const lines = [
+    `◆ Workflow: ${snapshot.name} (${snapshot.doneCount}/${snapshot.agentCount} done${state})${headerUsage ? ` · ${headerUsage}` : ""}`,
+  ];
 
   const agentPhaseNames = snapshot.agents
     .map((agent) => agent.phase)
@@ -163,9 +196,11 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
 
     const visibleAgents = agents.slice(-maxAgents);
     for (const agent of visibleAgents) {
-      const order = `#${agent.id}`;
-      const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${result}`);
+      lines.push(renderAgentLine(agent, { ...options, showModel, showUsage, showActivity, showPreviews }));
+      if (showPreviews) lines.push(...renderAgentPreviewLines(agent, options));
+      else if (showResultPreviews && agent.resultPreview) {
+        lines[lines.length - 1] += ` — ${shorten(agent.resultPreview, options.previewWidth ?? 96)}`;
+      }
     }
     if (agents.length > visibleAgents.length)
       lines.push(`    … ${agents.length - visibleAgents.length} earlier agents`);
@@ -175,8 +210,11 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
   if (unphased.length) {
     lines.push("  Unphased");
     for (const agent of unphased.slice(-maxAgents)) {
-      const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      lines.push(`    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${result}`);
+      lines.push(renderAgentLine(agent, { ...options, showModel, showUsage, showActivity, showPreviews }));
+      if (showPreviews) lines.push(...renderAgentPreviewLines(agent, options));
+      else if (showResultPreviews && agent.resultPreview) {
+        lines[lines.length - 1] += ` — ${shorten(agent.resultPreview, options.previewWidth ?? 96)}`;
+      }
     }
   }
 
@@ -198,10 +236,11 @@ export function renderWorkflowText(
 }
 
 function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {
-  if (completed) return `workflow ✓ ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount}`;
+  const usage = snapshot.usage ? ` · ${formatUsage(snapshot.usage)}` : "";
+  if (completed) return `workflow ✓ ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount}${usage}`;
   if (snapshot.runningCount > 0)
-    return `workflow ${snapshot.name}: ${snapshot.runningCount} running, ${snapshot.doneCount}/${snapshot.agentCount} done`;
-  return `workflow ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount} done`;
+    return `workflow ${snapshot.name}: ${snapshot.runningCount} running, ${snapshot.doneCount}/${snapshot.agentCount} done${usage}`;
+  return `workflow ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount} done${usage}`;
 }
 
 function statusIcon(status: WorkflowAgentStatus): string {
@@ -229,7 +268,80 @@ function shorten(value: string, max: number): string {
 }
 
 export function preview(value: unknown, max = 80): string {
-  const text = typeof value === "string" ? value : JSON.stringify(value);
-  if (!text) return "";
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  return previewValue(value, max);
+}
+
+function renderAgentLine(agent: WorkflowAgentSnapshot, options: WorkflowDisplayOptions): string {
+  const parts = [`#${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 40)}`];
+  if (options.showModel) parts.push(formatModel(agent), formatThinkingLevel(agent));
+  if (options.showActivity) parts.push(formatActivity(agent));
+  if (options.showUsage) parts.push(formatUsage(agent.usage ?? agent.metadata?.usage) ?? "tokens pending");
+  return `    ${parts.join(" · ")}`;
+}
+
+function renderAgentPreviewLines(agent: WorkflowAgentSnapshot, options: WorkflowDisplayOptions): string[] {
+  const max = options.previewWidth ?? 108;
+  const activity = agent.activity ?? agent.metadata?.activity;
+  const lines: string[] = [];
+  const prompt = agent.promptPreview ?? agent.metadata?.promptPreview ?? preview(agent.prompt, max);
+  const output = agent.outputPreview ?? agent.metadata?.outputPreview ?? agent.resultPreview;
+  const tool = activity?.toolResultPreview
+    ? `${activity.toolName ?? "tool"} result: ${activity.toolResultPreview}`
+    : activity?.toolArgsPreview
+      ? `${activity.toolName ?? "tool"} args: ${activity.toolArgsPreview}`
+      : activity?.preview;
+
+  if (prompt) lines.push(`      in: ${shorten(prompt, max)}`);
+  if (tool) lines.push(`      tool: ${shorten(tool, max)}`);
+  if (output) lines.push(`      out: ${shorten(output, max)}`);
+  return lines.slice(0, 3);
+}
+
+function formatModel(agent: WorkflowAgentSnapshot): string {
+  const resolved = agent.metadata?.model;
+  if (resolved) return `${resolved.provider}/${resolved.id}`;
+  const requested = agent.model;
+  if (!requested) return "model default";
+  if (typeof requested === "string") return requested;
+  if (requested.provider && requested.id) return `${requested.provider}/${requested.id}`;
+  return requested.id ?? requested.provider ?? "model pending";
+}
+
+function formatThinkingLevel(agent: WorkflowAgentSnapshot): string {
+  return agent.metadata?.thinkingLevel ?? agent.thinkingLevel ?? "effort default";
+}
+
+function formatActivity(agent: WorkflowAgentSnapshot): string {
+  const activity = agent.activity ?? agent.metadata?.activity;
+  if (activity?.text) return shorten(activity.text, 56);
+  switch (agent.status) {
+    case "queued":
+      return "queued";
+    case "running":
+      return "running";
+    case "done":
+      return "done";
+    case "error":
+      return agent.error ? `error: ${shorten(agent.error, 40)}` : "error";
+    case "skipped":
+      return "skipped";
+  }
+}
+
+function formatUsage(usage: WorkflowTokenUsage | undefined): string | undefined {
+  if (!usage) return undefined;
+  const parts = [`${formatTokens(usage.total)} tok`];
+  if (usage.input || usage.output) parts.push(`in ${formatTokens(usage.input)}`, `out ${formatTokens(usage.output)}`);
+  if (usage.cacheRead) parts.push(`cacheR ${formatTokens(usage.cacheRead)}`);
+  if (usage.cacheWrite) parts.push(`cacheW ${formatTokens(usage.cacheWrite)}`);
+  if (usage.cost.total) parts.push(`$${usage.cost.total.toFixed(4)}`);
+  return parts.join(" ");
+}
+
+function formatTokens(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0";
+  if (value < 1000) return Math.round(value).toString();
+  if (value < 10000) return `${(value / 1000).toFixed(1)}k`;
+  if (value < 1000000) return `${Math.round(value / 1000)}k`;
+  return `${(value / 1000000).toFixed(1)}M`;
 }

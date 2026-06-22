@@ -33,9 +33,14 @@ export type WorkflowToolInput = {
 const workflowDisplayOptions = {
   key: "workflow",
   streamToolUpdates: true,
-  maxAgents: 4,
-  maxLogs: 1,
-  showResultPreviews: false,
+  maxAgents: 6,
+  maxLogs: 2,
+  showResultPreviews: true,
+  showModel: true,
+  showUsage: true,
+  showActivity: true,
+  showPreviews: true,
+  previewWidth: 104,
 } as const;
 
 export interface WorkflowToolOptions {
@@ -48,17 +53,21 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     name: "workflow",
     label: "Workflow",
     description: [
-      "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline().",
+      "Execute trusted JavaScript workflow orchestration that coordinates multiple subagents with agent(), parallel(), and pipeline().",
       "script is required raw JavaScript. It must start with export const meta = { name, description } and must call agent() at least once; phases are optional metadata.",
     ].join(" "),
     promptSnippet:
-      "Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Use phase(title) at runtime to create progress groups.",
+      "Run a trusted JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Use phase(title) at runtime to create progress groups.",
     promptGuidelines: [
       "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
       "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
       "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is optional metadata for a stable upfront outline.",
-      "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().",
+      "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), or fs. Workflow JavaScript is trusted orchestration code under Pi's normal tool/session trust model.",
       "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
+      "For workflow, agent options may include model, thinkingLevel, and isolation. Prefer enabled model refs such as provider/id when the task benefits from different model strengths.",
+      "For workflow, use isolation: { mode: 'worktree', dirty: 'ignore', merge: 'none' } for read-only project audits when subagents should not touch the parent working tree.",
+      "For workflow, when the user asks for a project audit, security review, or improvement review, put worktree isolation on every project-inspection agent; reserve non-isolated agents only for pure synthesis that does not inspect or mutate files.",
+      "For workflow, the live TUI shows each subagent's model, thinking level, current activity, tool/prompt/output previews, and token/cost usage when available. Use short unique labels and explicit model/thinkingLevel options so the running workflow remains easy to follow.",
       "For workflow, call phase(title) when a new group of work starts. Phase names may be conditional or built in a loop; do not predeclare speculative phases just in case.",
       "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
       "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
@@ -77,7 +86,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       const script = normalizeWorkflowScript(params.script);
       const parsed = parseWorkflowScript(script);
       let snapshot: WorkflowSnapshot = createWorkflowSnapshot(parsed.meta);
-      const display = createToolUpdateWorkflowDisplay(onUpdate, undefined, workflowDisplayOptions);
+      const display = createToolUpdateWorkflowDisplay(onUpdate, ctx, workflowDisplayOptions);
 
       const update = () => {
         snapshot = recomputeWorkflowSnapshot(snapshot);
@@ -118,16 +127,41 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
               phase: event.phase,
               prompt: event.prompt,
               status: "running",
+              model: event.model,
+              thinkingLevel: event.thinkingLevel,
+              isolation: event.isolation,
+              promptPreview: preview(event.prompt, workflowDisplayOptions.previewWidth),
+              activity: { kind: "starting", text: "starting", updatedAt: Date.now() },
             });
             update();
           },
+          onAgentUpdate(event) {
+            const agent = findSnapshotAgent(snapshot, event.label, "running");
+            if (agent) {
+              agent.metadata = event.metadata;
+              agent.activity = event.metadata.activity;
+              agent.usage = event.metadata.usage;
+              agent.contextUsage = event.metadata.contextUsage;
+              agent.promptPreview = event.metadata.promptPreview ?? agent.promptPreview;
+              agent.outputPreview = event.metadata.outputPreview ?? agent.outputPreview;
+            }
+            update();
+          },
           onAgentEnd(event) {
-            const agent = [...snapshot.agents]
-              .reverse()
-              .find((item) => item.label === event.label && item.status === "running");
+            const agent = findSnapshotAgent(snapshot, event.label, "running");
             if (agent) {
               agent.status = event.result === null ? "error" : "done";
               agent.resultPreview = preview(event.result);
+              agent.metadata = event.metadata;
+              agent.activity = event.metadata?.activity ?? {
+                kind: agent.status === "done" ? "done" : "error",
+                text: agent.status === "done" ? "done" : "error",
+                updatedAt: Date.now(),
+              };
+              agent.usage = event.metadata?.usage;
+              agent.contextUsage = event.metadata?.contextUsage;
+              agent.promptPreview = event.metadata?.promptPreview ?? agent.promptPreview;
+              agent.outputPreview = event.metadata?.outputPreview ?? agent.resultPreview;
             }
             update();
           },
@@ -206,4 +240,11 @@ function normalizeWorkflowScript(script: string): string {
 function isAbortError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return /\babort(?:ed)?\b/i.test(error.message);
+}
+
+function findSnapshotAgent(snapshot: WorkflowSnapshot, label: string, status?: "running") {
+  return [...snapshot.agents].reverse().find((agent) => {
+    if (agent.label !== label) return false;
+    return status ? agent.status === status : true;
+  });
 }

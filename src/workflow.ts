@@ -1,8 +1,13 @@
-import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
 import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
+import type {
+  WorkflowAgentRunMetadata,
+  WorkflowModelRef,
+  WorkflowThinkingLevel,
+  WorktreeIsolation,
+} from "./options.js";
 
 export interface WorkflowMetaPhase {
   title: string;
@@ -25,8 +30,16 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   signal?: AbortSignal;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
-  onAgentStart?: (event: { label: string; phase?: string; prompt: string }) => void;
-  onAgentEnd?: (event: { label: string; phase?: string; result: unknown }) => void;
+  onAgentStart?: (event: {
+    label: string;
+    phase?: string;
+    prompt: string;
+    model?: WorkflowModelRef;
+    thinkingLevel?: WorkflowThinkingLevel;
+    isolation?: WorktreeIsolation;
+  }) => void;
+  onAgentUpdate?: (event: { label: string; phase?: string; metadata: WorkflowAgentRunMetadata }) => void;
+  onAgentEnd?: (event: { label: string; phase?: string; result: unknown; metadata?: WorkflowAgentRunMetadata }) => void;
 }
 
 export interface WorkflowRunResult<T = unknown> {
@@ -42,8 +55,9 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   label?: string;
   phase?: string;
   schema?: TSchemaDef;
-  model?: string;
-  isolation?: "worktree";
+  model?: WorkflowModelRef;
+  thinkingLevel?: WorkflowThinkingLevel;
+  isolation?: WorktreeIsolation;
   agentType?: string;
 }
 
@@ -57,8 +71,9 @@ interface RuntimeState {
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
 
-const NONDETERMINISM_ERROR =
-  "Workflow scripts must be deterministic: Date.now()/Math.random()/new Date() are unavailable";
+const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor as new (
+  ...args: string[]
+) => (ctx: Record<string, unknown>) => Promise<unknown>;
 
 export async function runWorkflow<T = unknown>(
   script: string,
@@ -108,7 +123,15 @@ export async function runWorkflow<T = unknown>(
     const run = limiter(async () => {
       state.agentCount++;
       const label = requestedLabel || defaultAgentLabel(assignedPhase, state.agentCount);
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt: taskPrompt });
+      options.onAgentStart?.({
+        label,
+        phase: assignedPhase,
+        prompt: taskPrompt,
+        model: normalizedOptions.model,
+        thinkingLevel: normalizedOptions.thinkingLevel,
+        isolation: normalizedOptions.isolation,
+      });
+      let metadata: WorkflowAgentRunMetadata | undefined;
       try {
         throwIfAborted();
         const result = await agentRunner.run(taskPrompt, {
@@ -116,15 +139,25 @@ export async function runWorkflow<T = unknown>(
           schema: normalizedOptions.schema,
           signal: options.signal,
           instructions: buildAgentInstructions(assignedPhase, normalizedOptions),
+          model: normalizedOptions.model,
+          thinkingLevel: normalizedOptions.thinkingLevel,
+          isolation: normalizedOptions.isolation,
+          onMetadata(value: WorkflowAgentRunMetadata) {
+            metadata = value;
+          },
+          onUpdate(value: WorkflowAgentRunMetadata) {
+            metadata = value;
+            options.onAgentUpdate?.({ label, phase: assignedPhase, metadata: value });
+          },
         } as any);
         throwIfAborted();
         state.spent += estimateTokens(result);
-        options.onAgentEnd?.({ label, phase: assignedPhase, result });
+        options.onAgentEnd?.({ label, phase: assignedPhase, result, metadata });
         return result;
       } catch (error) {
         if (options.signal?.aborted) throw error;
         log(`agent ${label} failed: ${error instanceof Error ? error.message : String(error)}`);
-        options.onAgentEnd?.({ label, phase: assignedPhase, result: null });
+        options.onAgentEnd?.({ label, phase: assignedPhase, result: null, metadata });
         return null;
       }
     });
@@ -183,7 +216,7 @@ export async function runWorkflow<T = unknown>(
     );
   };
 
-  const context = vm.createContext({
+  const context = {
     agent,
     parallel,
     pipeline,
@@ -209,10 +242,16 @@ export async function runWorkflow<T = unknown>(
     Set,
     Map,
     Promise,
-  });
+  };
 
-  const wrapped = `(async () => {\n${body}\n})()`;
-  const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+  const fn = new AsyncFunction(
+    "ctx",
+    `
+const { agent, parallel, pipeline, log, phase, args, cwd, process, budget, console, JSON, Math, Array, Object, String, Number, Boolean, Set, Map, Promise } = ctx;
+${body}
+`,
+  );
+  const result = await fn(context);
   await Promise.allSettled([...pendingAgentRuns]);
   assertStructuredCloneable(result, "workflow result");
   return {
@@ -233,8 +272,6 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
     allowReturnOutsideFunction: true,
     ranges: false,
   }) as AnyNode;
-
-  assertDeterministicAst(ast);
 
   const first = ast.body?.[0] as AnyNode | undefined;
   if (first?.type !== "ExportNamedDeclaration") {
@@ -309,64 +346,6 @@ function propertyKey(node: AnyNode, path: string): string {
   throw new Error(`unsupported key type in ${path}: ${node.type}`);
 }
 
-function assertDeterministicAst(node: AnyNode): void {
-  if (isDateNowCall(node) || isMathRandomCall(node) || isNewDateExpression(node)) {
-    throw new Error(NONDETERMINISM_ERROR);
-  }
-
-  for (const child of astChildren(node)) assertDeterministicAst(child);
-}
-
-function astChildren(node: AnyNode): AnyNode[] {
-  const children: AnyNode[] = [];
-  for (const value of Object.values(node)) {
-    if (Array.isArray(value)) children.push(...value.filter(isAstNode));
-    else if (isAstNode(value)) children.push(value);
-  }
-  return children;
-}
-
-function isAstNode(value: unknown): value is AnyNode {
-  return !!value && typeof value === "object" && typeof (value as AnyNode).type === "string";
-}
-
-function isDateNowCall(node: AnyNode): boolean {
-  return node.type === "CallExpression" && isMemberExpression(node.callee, "Date", "now");
-}
-
-function isMathRandomCall(node: AnyNode): boolean {
-  return node.type === "CallExpression" && isMemberExpression(node.callee, "Math", "random");
-}
-
-function isNewDateExpression(node: AnyNode): boolean {
-  return node.type === "NewExpression" && node.callee?.type === "Identifier" && node.callee.name === "Date";
-}
-
-function isMemberExpression(node: AnyNode | undefined, objectName: string, propertyName: string): boolean {
-  if (node?.type !== "MemberExpression" || node.object?.type !== "Identifier" || node.object.name !== objectName) {
-    return false;
-  }
-  return propertyNameOf(node) === propertyName;
-}
-
-function propertyNameOf(node: AnyNode): string | undefined {
-  if (!node.computed && node.property?.type === "Identifier") return node.property.name;
-  return staticStringOf(node.property);
-}
-
-function staticStringOf(node: AnyNode | undefined): string | undefined {
-  if (node?.type === "Literal" && typeof node.value === "string") return node.value;
-  if (node?.type === "TemplateLiteral" && node.expressions.length === 0) {
-    return node.quasis.map((quasi: AnyNode) => quasi.value.cooked ?? quasi.value.raw).join("");
-  }
-  if (node?.type === "BinaryExpression" && node.operator === "+") {
-    const left = staticStringOf(node.left);
-    const right = staticStringOf(node.right);
-    if (left !== undefined && right !== undefined) return left + right;
-  }
-  return undefined;
-}
-
 function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
   if (!meta || typeof meta !== "object") throw new Error("meta must be an object");
   const value = meta as WorkflowMeta;
@@ -413,6 +392,75 @@ function optionalString(value: unknown, name: string): string | undefined {
   return requireString(value, name);
 }
 
+function optionalThinkingLevel(value: unknown): WorkflowThinkingLevel | undefined {
+  if (value === undefined) return undefined;
+  if (
+    value === "off" ||
+    value === "minimal" ||
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh"
+  ) {
+    return value;
+  }
+  throw new TypeError("agent thinkingLevel must be one of off, minimal, low, medium, high, xhigh");
+}
+
+function optionalModelRef(value: unknown): WorkflowModelRef | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("agent model must be a string or { provider, id } object");
+  }
+  const model = value as { provider?: unknown; id?: unknown };
+  return {
+    provider: optionalString(model.provider, "agent model provider"),
+    id: optionalString(model.id, "agent model id"),
+  };
+}
+
+function optionalIsolation(value: unknown): WorktreeIsolation | undefined {
+  if (value === undefined) return undefined;
+  if (value === "none" || value === "worktree") return value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("agent isolation must be 'none', 'worktree', or a worktree options object");
+  }
+  const isolation = value as Record<string, unknown>;
+  if (isolation.mode !== "worktree") throw new TypeError("agent isolation mode must be 'worktree'");
+  const normalized: Exclude<WorktreeIsolation, "none" | "worktree"> = { mode: "worktree" };
+  const baseRef = optionalString(isolation.baseRef, "agent isolation baseRef");
+  const rootDir = optionalString(isolation.rootDir, "agent isolation rootDir");
+  const branch = optionalString(isolation.branch, "agent isolation branch");
+  const keep = optionalKeep(isolation.keep);
+  const dirty = optionalDirty(isolation.dirty);
+  const merge = optionalMerge(isolation.merge);
+  if (baseRef !== undefined) normalized.baseRef = baseRef;
+  if (rootDir !== undefined) normalized.rootDir = rootDir;
+  if (branch !== undefined) normalized.branch = branch;
+  if (keep !== undefined) normalized.keep = keep;
+  if (dirty !== undefined) normalized.dirty = dirty;
+  if (merge !== undefined) normalized.merge = merge;
+  return normalized;
+}
+
+function optionalKeep(value: unknown): boolean | "onError" | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "boolean" || value === "onError") return value;
+  throw new TypeError("agent isolation keep must be a boolean or 'onError'");
+}
+
+function optionalDirty(value: unknown): "fail" | "ignore" | "patch" | undefined {
+  if (value === undefined) return undefined;
+  if (value === "fail" || value === "ignore" || value === "patch") return value;
+  throw new TypeError("agent isolation dirty must be 'fail', 'ignore', or 'patch'");
+}
+
+function optionalMerge(value: unknown): "none" | undefined {
+  if (value === undefined || value === "none") return value;
+  throw new TypeError("agent isolation merge currently supports only 'none'");
+}
+
 function normalizeAgentOptions(value: unknown): AgentOptions {
   if (!value || typeof value !== "object") throw new TypeError("agent options must be an object");
   const options = value as AgentOptions;
@@ -420,8 +468,9 @@ function normalizeAgentOptions(value: unknown): AgentOptions {
     ...options,
     label: optionalString(options.label, "agent label"),
     phase: optionalString(options.phase, "agent phase"),
-    model: optionalString(options.model, "agent model"),
-    isolation: options.isolation,
+    model: optionalModelRef(options.model),
+    thinkingLevel: optionalThinkingLevel(options.thinkingLevel),
+    isolation: optionalIsolation(options.isolation),
     agentType: optionalString(options.agentType, "agent type"),
   };
 }
@@ -445,8 +494,6 @@ function buildAgentInstructions(phase: string | undefined, options: AgentOptions
   const lines = [];
   if (phase) lines.push(`Workflow phase: ${phase}`);
   if (options.agentType) lines.push(`Act as workflow subagent type: ${options.agentType}`);
-  if (options.isolation) lines.push(`Requested isolation: ${options.isolation}`);
-  if (options.model) lines.push(`Requested model: ${options.model}`);
   return lines.length ? lines.join("\n") : undefined;
 }
 

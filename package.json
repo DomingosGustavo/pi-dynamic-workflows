@@ -23,7 +23,8 @@
   ],
   "scripts": {
     "test": "npm run check && npm run build && npm run test:unit",
-    "test:unit": "tsx --test tests/**/*.test.ts",
+    "test:unit": "TMPDIR=/tmp tsx --test tests/**/*.test.ts",
+    "test:e2e:fintrack": "TMPDIR=/tmp tsx --test tests/fintrack-e2e.ts",
     "check": "biome check .",
     "format": "biome format --write .",
     "lint": "biome lint .",

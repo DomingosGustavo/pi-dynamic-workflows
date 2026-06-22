@@ -31,13 +31,37 @@ declare global {
     phase?: string;
     /** JSON Schema for structured output. When present, the returned value is typed as unknown unless you provide a generic. */
     schema?: TSchema;
-    /** Requested model name. Currently passed as subagent guidance. */
-    model?: string;
-    /** Requested isolation mode. */
-    isolation?: "worktree";
+    /** Requested Pi model for this subagent. Use provider/id when possible, for example `anthropic/claude-sonnet-4-6`. */
+    model?: WorkflowModelRef;
+    /** Requested thinking level for this subagent. */
+    thinkingLevel?: WorkflowThinkingLevel;
+    /** Requested isolation mode. Worktree isolation is opt-in and does not merge changes back. */
+    isolation?: WorkflowWorktreeIsolation;
     /** Requested subagent role/type. */
     agentType?: string;
   }
+
+  type WorkflowModelRef =
+    | string
+    | {
+        provider?: string;
+        id?: string;
+      };
+
+  type WorkflowThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+  type WorkflowWorktreeIsolation =
+    | "none"
+    | "worktree"
+    | {
+        mode: "worktree";
+        baseRef?: string;
+        rootDir?: string;
+        branch?: string;
+        keep?: boolean | "onError";
+        dirty?: "fail" | "ignore" | "patch";
+        merge?: "none";
+      };
 
   type JsonPrimitive = string | number | boolean | null;
   type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -87,7 +111,7 @@ declare global {
   /** Current working directory for the workflow/subagents. */
   const cwd: string;
 
-  /** Deterministic process shim exposing only cwd(). */
+  /** Trusted workflow process shim exposing cwd(). */
   const process: { cwd(): string };
 
   /** Simple token-budget estimate for workflow runs. */

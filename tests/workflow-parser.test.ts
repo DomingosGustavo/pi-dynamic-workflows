@@ -92,7 +92,7 @@ test("parseWorkflowScript rejects template interpolation", () => {
   );
 });
 
-test("parseWorkflowScript rejects nondeterministic APIs", () => {
+test("parseWorkflowScript allows normal JavaScript Date and Math APIs", () => {
   for (const expression of [
     "Date.now()",
     "Date['now']()",
@@ -109,17 +109,6 @@ test("parseWorkflowScript rejects nondeterministic APIs", () => {
     "new Date()",
     "new (Date)()",
     "`timestamp $" + "{Date.now()}`",
-  ]) {
-    assert.throws(
-      () => parseWorkflowScript(`export const meta = { name: 'demo', description: 'desc' }\nreturn ${expression}`),
-      /must be deterministic/,
-      expression,
-    );
-  }
-});
-
-test("parseWorkflowScript allows deterministic Date and Math APIs", () => {
-  for (const expression of [
     "Date.parse('2020-01-01T00:00:00Z')",
     "Date.UTC(2020, 0, 1)",
     "Math.max(1, 2)",

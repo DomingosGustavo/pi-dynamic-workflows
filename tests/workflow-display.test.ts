@@ -116,3 +116,61 @@ test("renderWorkflowLines separates logs from progress", () => {
   assert.ok(logIndex > 0);
   assert.equal(lines[logIndex - 1], "");
 });
+
+test("renderWorkflowLines shows rich model, effort, activity, previews, and usage", () => {
+  const lines = renderWorkflowLines(
+    snapshot({
+      agents: [
+        agent({
+          status: "running",
+          model: "anthropic/claude-sonnet-4-6",
+          thinkingLevel: "high",
+          activity: {
+            kind: "tool_running",
+            text: "running read src/auth.ts",
+            toolName: "read",
+            toolArgsPreview: '{"file_path":"src/auth.ts"}',
+            updatedAt: 123,
+          },
+          promptPreview: "Audit authentication and authorization surfaces.",
+          outputPreview: "Found a hardening gap in src/auth.ts.",
+          usage: {
+            input: 1000,
+            output: 250,
+            cacheRead: 100,
+            cacheWrite: 0,
+            total: 1350,
+            cost: { input: 0.004, output: 0.008, cacheRead: 0.0001, cacheWrite: 0, total: 0.0121 },
+            turns: 1,
+          },
+        }),
+      ],
+    }),
+    { showModel: true, showUsage: true, showActivity: true, showPreviews: true },
+  );
+
+  const text = lines.join("\n");
+  assert.match(text, /demo_workflow .*1\.4k tok/);
+  assert.match(text, /anthropic\/claude-sonnet-4-6/);
+  assert.match(text, /high/);
+  assert.match(text, /running read src\/auth\.ts/);
+  assert.match(text, /1\.4k tok in 1\.0k out 250 cacheR 100 \$0\.0121/);
+  assert.match(text, /in: Audit authentication/);
+  assert.match(text, /tool: read args: \{"file_path":"src\/auth\.ts"\}/);
+  assert.match(text, /out: Found a hardening gap in src\/auth\.ts\./);
+});
+
+test("renderWorkflowLines has readable rich fallbacks for missing metadata", () => {
+  const text = renderWorkflowLines(
+    snapshot({
+      agents: [agent({ status: "running", model: undefined, thinkingLevel: undefined })],
+    }),
+    { showModel: true, showUsage: true, showActivity: true },
+  ).join("\n");
+
+  assert.match(text, /model default/);
+  assert.match(text, /effort default/);
+  assert.match(text, /running/);
+  assert.match(text, /tokens pending/);
+  assert.doesNotMatch(text, /undefined/);
+});
