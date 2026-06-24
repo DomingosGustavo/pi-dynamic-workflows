@@ -31,7 +31,7 @@ declare global {
     phase?: string;
     /** JSON Schema for structured output. When present, the returned value is typed as unknown unless you provide a generic. */
     schema?: TSchema;
-    /** Requested Pi model for this subagent. Use provider/id when possible, for example `anthropic/claude-sonnet-4-6`. */
+    /** Requested Pi model for this subagent. Use provider/id when possible, for example `opencode-go/deepseek-v4-flash`. */
     model?: WorkflowModelRef;
     /** Requested thinking level for this subagent. */
     thinkingLevel?: WorkflowThinkingLevel;

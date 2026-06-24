@@ -1,7 +1,7 @@
 {
   "name": "pi-dynamic-workflows",
   "version": "1.0.1",
-  "description": "Claude-Code-style dynamic workflow orchestration for Pi.",
+  "description": "Dynamic multi-agent workflow orchestration for Pi.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -17,6 +17,7 @@
   "files": [
     "dist/",
     "extensions/",
+    "skills/",
     "src/",
     "types/",
     "README.md"

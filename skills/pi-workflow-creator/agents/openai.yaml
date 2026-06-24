@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pi Workflow Creator"
+  short_description: "Design Pi multi-agent workflow scripts"
+  default_prompt: "Use $pi-workflow-creator to design a Pi workflow for this task."

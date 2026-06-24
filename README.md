@@ -1,12 +1,10 @@
 # pi-dynamic-workflows
 
-> Claude-Code-style dynamic workflows for [Pi](https://github.com/earendil-works/pi).
+> Dynamic multi-agent workflows for [Pi](https://github.com/earendil-works/pi).
 
 A Pi extension that adds a `workflow` tool. Instead of one assistant doing everything sequentially, the model writes a small JavaScript script that fans out the work across many isolated subagents, then synthesizes the results.
 
-Great for codebase audits, multi-perspective review, large refactors, and fan-out research.
-
-Inspired by Anthropic's [dynamic workflows in Claude Code](https://claude.com/blog/introducing-dynamic-workflows-in-claude-code).
+Great for codebase audits, multi-perspective review, large refactors, and fan-out research across whatever model providers your Pi session has enabled.
 
 ## Install
 
@@ -23,6 +21,15 @@ Then in Pi:
 ```
 
 That's it. The extension registers a `workflow` tool and activates it on session start.
+
+## Workflow Creator Skill
+
+This repo includes a Codex skill at `skills/pi-workflow-creator` for designing Pi workflow scripts. Invoke it as
+`$pi-workflow-creator` when you want the parent model to choose the workflow topology, model mix, structured output
+schemas, and isolation strategy before generating a `workflow` tool script.
+
+The skill includes Pi-specific API docs, orchestration patterns, model-selection guidance, starter templates, worked
+examples, and `scripts/validate-workflow.mjs` for checking generated workflow files before running them.
 
 ## Usage
 
@@ -42,10 +49,10 @@ Approve the confirmation prompt to run this workflow.
 
 ◆ Workflow: inspect_project (3/3 done) · 42k tok in 31k out 11k $0.0842
   ✓ Scan 1/1
-    #1 ✓ repo inventory · anthropic/claude-haiku-4-5 · low · done · 9.2k tok in 7.1k out 2.1k $0.0061
+    #1 ✓ repo inventory · opencode-go/deepseek-v4-flash · low · done · 9.2k tok in 7.1k out 2.1k $0.0061
   ✓ Analyze 2/2
-    #2 ✓ source modules · anthropic/claude-sonnet-4-6 · medium · done · 18k tok in 14k out 4.0k $0.0310
-    #3 ✓ final summary · anthropic/claude-opus-4-8 · high · done · 15k tok in 10k out 5.0k $0.0471
+    #2 ✓ source modules · opencode-go/kimi-k2.7-code · medium · done · 18k tok in 14k out 4.0k $0.0310
+    #3 ✓ final summary · opencode-go/glm-5.2 · xhigh · done · 15k tok in 10k out 5.0k $0.0471
 ```
 
 While a workflow is running, each row can show the requested/resolved model, thinking level, current activity,
@@ -83,7 +90,7 @@ const summary = await agent(
   'Summarize the main modules from this inventory:\n' + inventory,
   {
     label: 'module summary',
-    model: 'anthropic/claude-sonnet-4-6',
+    model: 'opencode-go/deepseek-v4-flash',
     thinkingLevel: 'medium',
     isolation: { mode: 'worktree', dirty: 'ignore', merge: 'none' },
   },
@@ -130,7 +137,7 @@ Subagents can opt into real Git worktree isolation:
 ```js
 await agent('Audit src/lib/auth.ts for issues.', {
   label: 'security audit',
-  model: 'anthropic/claude-sonnet-4-6',
+  model: 'opencode-go/deepseek-v4-flash',
   thinkingLevel: 'high',
   isolation: { mode: 'worktree', dirty: 'ignore', merge: 'none' },
 })
@@ -139,11 +146,11 @@ await agent('Audit src/lib/auth.ts for issues.', {
 Worktree isolation creates a temporary Git worktree for that subagent, runs the Pi coding tools in that cwd, captures `git status --short` and `git diff --binary`, then removes the worktree unless `keep` says otherwise. Automatic merge-back is intentionally not implemented.
 
 The parent model decides the workflow shape, agent count, and model assignment from the current request. The tool
-prompt encourages enabled open-weight workhorse refs for broad inspection and implementation work:
-`opencode-go/kimi-k2.7-code`, `opencode-go/deepseek-v4-flash`, `opencode-go/qwen3.7-max`,
-`opencode-go/minimax-m3`, and `opencode-go/mimo-v2.5-pro`. For high-stakes review, it asks for two independent
-judge agents, `opencode-go/glm-5.2` and `anthropic/claude-opus-4-8`, both with `thinkingLevel: "xhigh"`, followed
-by synthesis.
+prompt encourages enabled provider/id refs rather than provider-specific aliases: `opencode-go/deepseek-v4-flash`
+as the high-volume workhorse, `opencode-go/kimi-k2.7-code` or `opencode-go/minimax-m3` for cheap agentic
+implementation/exploration, `opencode-go/glm-5.2` with `thinkingLevel: "xhigh"` as a lower-cost reasoning judge,
+and either `anthropic/claude-opus-4-8` or an enabled GPT 5.5 ref such as `openai-codex/gpt-5.5` for frontier
+judging.
 
 ### Structured subagent output
 

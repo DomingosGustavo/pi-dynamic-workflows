@@ -1,7 +1,14 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.4.16/schema.json",
   "files": {
-    "includes": ["**", "!dist", "!node_modules", "!.pi/workflows"]
+    "includes": [
+      "**",
+      "!dist",
+      "!node_modules",
+      "!.pi/workflows",
+      "!skills/pi-workflow-creator/assets/examples/*.js",
+      "!skills/pi-workflow-creator/assets/templates/*.js"
+    ]
   },
   "formatter": {
     "enabled": true,

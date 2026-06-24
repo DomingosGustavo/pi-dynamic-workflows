@@ -16,11 +16,10 @@ test("createWorkflowTool describes phases as optional and dynamic", () => {
   assert.ok(tool.promptGuidelines?.some((line) => line.includes("live TUI shows each subagent's model")));
   assert.ok(tool.promptGuidelines?.some((line) => line.includes("opencode-go/kimi-k2.7-code")));
   assert.ok(tool.promptGuidelines?.some((line) => line.includes("opencode-go/deepseek-v4-flash")));
-  assert.ok(tool.promptGuidelines?.some((line) => line.includes("opencode-go/qwen3.7-max")));
   assert.ok(tool.promptGuidelines?.some((line) => line.includes("opencode-go/minimax-m3")));
-  assert.ok(tool.promptGuidelines?.some((line) => line.includes("opencode-go/mimo-v2.5-pro")));
   assert.ok(tool.promptGuidelines?.some((line) => line.includes("opencode-go/glm-5.2")));
   assert.ok(tool.promptGuidelines?.some((line) => line.includes("anthropic/claude-opus-4-8")));
+  assert.ok(tool.promptGuidelines?.some((line) => line.includes("openai-codex/gpt-5.5")));
   assert.ok(tool.promptGuidelines?.some((line) => line.includes("thinkingLevel: 'xhigh'")));
 });
 
