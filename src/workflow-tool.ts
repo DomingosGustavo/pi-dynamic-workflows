@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -6,10 +8,10 @@ import {
   createWorkflowSnapshot,
   preview,
   recomputeWorkflowSnapshot,
-  renderWorkflowText,
   type WorkflowSnapshot,
 } from "./display.js";
-import { parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
+import type { WorkflowApprovalMode, WorkflowReviewMetadata } from "./options.js";
+import { parseWorkflowScript, runWorkflow, type WorkflowMeta, type WorkflowRunResult } from "./workflow.js";
 
 const workflowToolSchema = Type.Object({
   script: Type.String({
@@ -32,20 +34,22 @@ export type WorkflowToolInput = {
 
 const workflowDisplayOptions = {
   key: "workflow",
-  streamToolUpdates: true,
+  clearWidgetOnComplete: true,
   maxAgents: 6,
   maxLogs: 2,
-  showResultPreviews: true,
+  showResultPreviews: false,
   showModel: true,
   showUsage: true,
   showActivity: true,
-  showPreviews: true,
+  showPreviews: false,
   previewWidth: 104,
 } as const;
 
 export interface WorkflowToolOptions {
   cwd?: string;
   concurrency?: number;
+  approvalMode?: WorkflowApprovalMode;
+  reviewDir?: string;
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
@@ -65,9 +69,12 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), or fs. Workflow JavaScript is trusted orchestration code under Pi's normal tool/session trust model.",
       "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
       "For workflow, agent options may include model, thinkingLevel, and isolation. Prefer enabled model refs such as provider/id when the task benefits from different model strengths.",
+      "For workflow, dynamically choose the workflow shape, phase names, number of agents, and model assignments from the user's goal and repository context; do not reuse a fixed template when the task calls for a different decomposition.",
+      "For workflow, prefer enabled open-weight workhorse refs for broad repository inspection and implementation work when suitable: opencode-go/kimi-k2.7-code, opencode-go/deepseek-v4-flash, opencode-go/qwen3.7-max, opencode-go/minimax-m3, and opencode-go/mimo-v2.5-pro.",
+      "For workflow, high-stakes review or judging should use independent judge agents with opencode-go/glm-5.2 and anthropic/claude-opus-4-8, both with thinkingLevel: 'xhigh', then synthesize after comparing both judgments.",
       "For workflow, use isolation: { mode: 'worktree', dirty: 'ignore', merge: 'none' } for read-only project audits when subagents should not touch the parent working tree.",
       "For workflow, when the user asks for a project audit, security review, or improvement review, put worktree isolation on every project-inspection agent; reserve non-isolated agents only for pure synthesis that does not inspect or mutate files.",
-      "For workflow, the live TUI shows each subagent's model, thinking level, current activity, tool/prompt/output previews, and token/cost usage when available. Use short unique labels and explicit model/thinkingLevel options so the running workflow remains easy to follow.",
+      "For workflow, the live TUI shows each subagent's model, thinking level, current activity, and token/cost usage when available; full prompt, output, and tool metadata stays in details for inspection. Use short unique labels and explicit model/thinkingLevel options so the running workflow remains easy to follow.",
       "For workflow, call phase(title) when a new group of work starts. Phase names may be conditional or built in a loop; do not predeclare speculative phases just in case.",
       "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
       "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
@@ -85,11 +92,73 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const script = normalizeWorkflowScript(params.script);
       const parsed = parseWorkflowScript(script);
-      let snapshot: WorkflowSnapshot = createWorkflowSnapshot(parsed.meta);
+      const cwd = options.cwd ?? ctx.cwd;
+      const approvalMode = options.approvalMode ?? "interactive";
+      let review = await prepareWorkflowReview(script, parsed.meta, cwd, {
+        approvalMode,
+        reviewDir: options.reviewDir,
+      });
+      onUpdate?.({
+        content: [{ type: "text", text: renderWorkflowReviewText(parsed.meta, review) }],
+        details: {
+          name: parsed.meta.name,
+          meta: parsed.meta,
+          review,
+        },
+      });
+
+      if (signal?.aborted) throw new Error("Workflow was aborted");
+
+      if (approvalMode === "interactive") {
+        if (!ctx.hasUI) {
+          throw new Error(
+            "workflow approval requires an interactive UI; pass approvalMode: 'auto' only for trusted automation",
+          );
+        }
+        const approved = await ctx.ui.confirm(
+          "Run workflow?",
+          [
+            `Review file: ${review.path}`,
+            "",
+            `Run workflow "${parsed.meta.name}" now?`,
+            "Rejecting leaves the review file in place and starts no agents.",
+          ].join("\n"),
+          signal ? { signal } : undefined,
+        );
+        review = approved
+          ? { ...review, approved: true, status: "approved" }
+          : { ...review, approved: false, status: "rejected" };
+        if (!approved) {
+          const snapshot = recomputeWorkflowSnapshot({
+            ...createWorkflowSnapshot(parsed.meta),
+            review,
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Workflow ${parsed.meta.name} was not run. Review file: ${review.path}`,
+              },
+            ],
+            details: {
+              ...snapshot,
+              meta: parsed.meta,
+              review,
+              phases: [],
+              logs: [],
+            },
+          };
+        }
+      } else {
+        review = { ...review, approved: true, status: "auto" };
+      }
+
+      let snapshot: WorkflowSnapshot = { ...createWorkflowSnapshot(parsed.meta), review };
       const display = createToolUpdateWorkflowDisplay(onUpdate, ctx, workflowDisplayOptions);
 
       const update = () => {
         snapshot = recomputeWorkflowSnapshot(snapshot);
+        snapshot.review = review;
         display.update(snapshot);
       };
 
@@ -101,7 +170,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       let result: WorkflowRunResult;
       try {
         result = await runWorkflow(script, {
-          cwd: options.cwd ?? ctx.cwd,
+          cwd,
           args: params.args,
           signal,
           concurrency: options.concurrency,
@@ -189,6 +258,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 
       snapshot.result = result.result;
       snapshot.durationMs = result.durationMs;
+      snapshot.review = review;
       snapshot = recomputeWorkflowSnapshot(snapshot);
       display.complete(snapshot);
 
@@ -206,17 +276,14 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           logs: result.logs,
           result: result.result,
           durationMs: result.durationMs,
+          review,
         },
       };
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("workflow")), 0, 0);
     },
-    renderResult(result, { isPartial }, theme) {
-      const snapshot = result.details as WorkflowSnapshot | undefined;
-      if (snapshot?.name) {
-        return new Text(renderWorkflowText(snapshot, !isPartial, workflowDisplayOptions), 0, 0);
-      }
+    renderResult(result, _renderOptions, theme) {
       const text = result.content?.[0];
       return new Text(text?.type === "text" ? text.text : theme.fg("muted", "workflow"), 0, 0);
     },
@@ -235,6 +302,74 @@ function normalizeWorkflowScript(script: string): string {
   const fence = text.match(/^```(?:js|javascript)?\s*\n([\s\S]*?)\n```$/i);
   if (fence) text = fence[1].trim();
   return text;
+}
+
+export async function prepareWorkflowReview(
+  script: string,
+  meta: WorkflowMeta,
+  cwd: string,
+  options: {
+    approvalMode: WorkflowApprovalMode;
+    reviewDir?: string;
+    now?: Date;
+  },
+): Promise<WorkflowReviewMetadata> {
+  const normalized = normalizeWorkflowScript(script);
+  const reviewScript = normalized.endsWith("\n") ? normalized : `${normalized}\n`;
+  const dir = resolveWorkflowReviewDir(cwd, options.reviewDir);
+  await mkdir(dir, { recursive: true });
+  const path = join(
+    dir,
+    `${formatReviewTimestamp(options.now ?? new Date())}-${slugWorkflowName(meta.name)}.workflow.js`,
+  );
+  await writeFile(path, reviewScript, "utf8");
+  return {
+    path,
+    script: reviewScript,
+    approved: false,
+    approvalMode: options.approvalMode,
+    status: "pending",
+  };
+}
+
+function resolveWorkflowReviewDir(cwd: string, reviewDir?: string): string {
+  if (!reviewDir) return join(cwd, ".pi", "workflows");
+  return isAbsolute(reviewDir) ? reviewDir : resolve(cwd, reviewDir);
+}
+
+export function slugWorkflowName(name: string): string {
+  return (
+    name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80)
+      .replace(/-+$/g, "") || "workflow"
+  );
+}
+
+function formatReviewTimestamp(now: Date): string {
+  return now
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.\d{3}Z$/, "Z");
+}
+
+function renderWorkflowReviewText(meta: WorkflowMeta, review: WorkflowReviewMetadata): string {
+  return [
+    "Workflow ready for review",
+    `File: ${review.path}`,
+    "",
+    "```js",
+    review.script.trimEnd(),
+    "```",
+    "",
+    review.approvalMode === "auto"
+      ? "approvalMode is auto; trusted automation will run this workflow after review metadata is recorded."
+      : "Approve the confirmation prompt to run this workflow.",
+    `Workflow: ${meta.name}`,
+  ].join("\n");
 }
 
 function isAbortError(error: unknown): boolean {

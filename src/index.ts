@@ -20,9 +20,12 @@ export type {
   WorkflowAgentActivity,
   WorkflowAgentActivityKind,
   WorkflowAgentRunMetadata,
+  WorkflowApprovalMode,
   WorkflowContextUsage,
   WorkflowCostUsage,
   WorkflowModelRef,
+  WorkflowReviewMetadata,
+  WorkflowReviewStatus,
   WorkflowThinkingLevel,
   WorkflowTokenUsage,
   WorkflowWorktreeMetadata,
@@ -48,5 +51,5 @@ export type {
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
 export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
-export { createWorkflowTool } from "./workflow-tool.js";
+export { createWorkflowTool, prepareWorkflowReview, slugWorkflowName } from "./workflow-tool.js";
 export { normalizeWorktreeIsolation, WorkflowWorktreeManager } from "./worktree.js";

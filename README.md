@@ -35,21 +35,27 @@ Run a workflow to inspect this repository and summarize the main modules.
 The model will write a workflow script and call the `workflow` tool. Live progress shows up inline:
 
 ```text
+Workflow ready for review
+File: /path/to/repo/.pi/workflows/20260622T220000Z-inspect_project.workflow.js
+
+Approve the confirmation prompt to run this workflow.
+
 ◆ Workflow: inspect_project (3/3 done) · 42k tok in 31k out 11k $0.0842
   ✓ Scan 1/1
     #1 ✓ repo inventory · anthropic/claude-haiku-4-5 · low · done · 9.2k tok in 7.1k out 2.1k $0.0061
-      in: Inspect the repository structure and identify important entry points.
-      out: Main code is under src/, with extension entrypoint extensions/workflow.ts.
   ✓ Analyze 2/2
     #2 ✓ source modules · anthropic/claude-sonnet-4-6 · medium · done · 18k tok in 14k out 4.0k $0.0310
-      out: The workflow runtime lives in src/workflow.ts and subagents run via src/agent.ts.
     #3 ✓ final summary · anthropic/claude-opus-4-8 · high · done · 15k tok in 10k out 5.0k $0.0471
-      out: Prioritized findings include...
 ```
 
 While a workflow is running, each row can show the requested/resolved model, thinking level, current activity,
-tool/prompt/output previews, and token/cost totals as soon as Pi reports them. Token usage may show as pending
-while an agent is streaming and becomes exact after the agent finishes.
+and token/cost totals as soon as Pi reports them. Token usage may show as pending while an agent is streaming
+and becomes exact after the agent finishes. Full prompt, output, and tool metadata is still kept in workflow
+details for inspection, but the default inline view stays compact.
+
+Before execution, the generated script is written to `.pi/workflows/` and streamed back with its absolute path
+and source code. Interactive sessions must approve the confirmation prompt before any subagent starts. Tests and
+trusted automation can construct the tool with `approvalMode: "auto"`.
 
 Press `Esc` to cancel a running workflow. Active subagents are aborted and surfaced as skipped.
 
@@ -132,6 +138,13 @@ await agent('Audit src/lib/auth.ts for issues.', {
 
 Worktree isolation creates a temporary Git worktree for that subagent, runs the Pi coding tools in that cwd, captures `git status --short` and `git diff --binary`, then removes the worktree unless `keep` says otherwise. Automatic merge-back is intentionally not implemented.
 
+The parent model decides the workflow shape, agent count, and model assignment from the current request. The tool
+prompt encourages enabled open-weight workhorse refs for broad inspection and implementation work:
+`opencode-go/kimi-k2.7-code`, `opencode-go/deepseek-v4-flash`, `opencode-go/qwen3.7-max`,
+`opencode-go/minimax-m3`, and `opencode-go/mimo-v2.5-pro`. For high-stakes review, it asks for two independent
+judge agents, `opencode-go/glm-5.2` and `anthropic/claude-opus-4-8`, both with `thinkingLevel: "xhigh"`, followed
+by synthesis.
+
 ### Structured subagent output
 
 Pass a JSON Schema via `opts.schema` and the subagent will return a validated object:
@@ -157,7 +170,9 @@ Under the hood this is a Pi `structured_output` tool with `terminate: true`, so 
 ```text
 user prompt
   → Pi model writes a workflow script
-  → workflow tool parses meta + runs trusted orchestration JavaScript
+  → workflow tool parses meta + writes .pi/workflows review artifact
+  → user approves the generated script in interactive sessions
+  → workflow tool runs trusted orchestration JavaScript
   → script calls agent(), parallel(), pipeline()
   → each agent() spawns an in-memory Pi subagent session, optionally in a Git worktree
   → snapshots stream back as compact progress

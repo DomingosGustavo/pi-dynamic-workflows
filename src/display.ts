@@ -4,6 +4,7 @@ import type {
   WorkflowAgentRunMetadata,
   WorkflowContextUsage,
   WorkflowModelRef,
+  WorkflowReviewMetadata,
   WorkflowThinkingLevel,
   WorkflowTokenUsage,
   WorktreeIsolation,
@@ -45,6 +46,7 @@ export interface WorkflowSnapshot {
   errorCount: number;
   durationMs?: number;
   usage?: WorkflowTokenUsage;
+  review?: WorkflowReviewMetadata;
   result?: unknown;
 }
 
@@ -122,10 +124,11 @@ export function createWidgetWorkflowDisplay(
 export function createToolUpdateWorkflowDisplay(
   onUpdate: ((result: { content: Array<{ type: "text"; text: string }>; details: unknown }) => void) | undefined,
   ctx?: Pick<ExtensionContext, "ui" | "hasUI">,
-  options: WorkflowDisplayOptions & { streamToolUpdates?: boolean } = {},
+  options: WorkflowDisplayOptions & { streamToolUpdates?: boolean; clearWidgetOnComplete?: boolean } = {},
 ): WorkflowDisplay {
   const widget = ctx ? createWidgetWorkflowDisplay(ctx, options) : undefined;
   const streamToolUpdates = options.streamToolUpdates ?? !ctx?.hasUI;
+  const clearWidgetOnComplete = options.clearWidgetOnComplete ?? false;
 
   const emit = (snapshot: WorkflowSnapshot, completed = false) => {
     if (streamToolUpdates) {
@@ -134,7 +137,8 @@ export function createToolUpdateWorkflowDisplay(
         details: snapshot,
       });
     }
-    if (completed) widget?.complete(snapshot);
+    if (completed && clearWidgetOnComplete) widget?.clear();
+    else if (completed) widget?.complete(snapshot);
     else widget?.update(snapshot);
   };
 

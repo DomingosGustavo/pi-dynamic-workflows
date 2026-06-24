@@ -89,3 +89,15 @@ export interface WorkflowAgentRunMetadata {
   promptPreview?: string;
   outputPreview?: string;
 }
+
+export type WorkflowApprovalMode = "interactive" | "auto";
+
+export type WorkflowReviewStatus = "pending" | "approved" | "rejected" | "auto";
+
+export interface WorkflowReviewMetadata {
+  path: string;
+  script: string;
+  approved: boolean;
+  approvalMode: WorkflowApprovalMode;
+  status: WorkflowReviewStatus;
+}

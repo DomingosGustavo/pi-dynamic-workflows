@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createToolUpdateWorkflowDisplay,
   createWorkflowSnapshot,
   recomputeWorkflowSnapshot,
   renderWorkflowLines,
@@ -160,6 +161,45 @@ test("renderWorkflowLines shows rich model, effort, activity, previews, and usag
   assert.match(text, /out: Found a hardening gap in src\/auth\.ts\./);
 });
 
+test("renderWorkflowLines keeps preview metadata out of the default inline view", () => {
+  const value = snapshot({
+    agents: [
+      agent({
+        status: "done",
+        model: "anthropic/claude-sonnet-4-6",
+        thinkingLevel: "medium",
+        activity: {
+          kind: "tool_done",
+          text: "read src/auth.ts",
+          toolName: "read",
+          toolArgsPreview: '{"file_path":"src/auth.ts"}',
+          toolResultPreview: "auth source contents",
+          updatedAt: 123,
+        },
+        metadata: {
+          cwd: "/repo",
+          promptPreview: "Inspect auth",
+          outputPreview: "Auth output",
+        },
+        promptPreview: "Inspect auth",
+        outputPreview: "Auth output",
+        resultPreview: "Result preview",
+      }),
+    ],
+  });
+  const text = renderWorkflowLines(value, { showModel: true, showActivity: true, showUsage: true }).join("\n");
+
+  assert.match(text, /anthropic\/claude-sonnet-4-6/);
+  assert.match(text, /medium/);
+  assert.match(text, /read src\/auth\.ts/);
+  assert.doesNotMatch(text, /\bin:/);
+  assert.doesNotMatch(text, /\bout:/);
+  assert.doesNotMatch(text, /\btool:/);
+  assert.equal(value.agents[0]?.metadata?.promptPreview, "Inspect auth");
+  assert.equal(value.agents[0]?.metadata?.outputPreview, "Auth output");
+  assert.equal(value.agents[0]?.activity?.toolResultPreview, "auth source contents");
+});
+
 test("renderWorkflowLines has readable rich fallbacks for missing metadata", () => {
   const text = renderWorkflowLines(
     snapshot({
@@ -173,4 +213,44 @@ test("renderWorkflowLines has readable rich fallbacks for missing metadata", () 
   assert.match(text, /running/);
   assert.match(text, /tokens pending/);
   assert.doesNotMatch(text, /undefined/);
+});
+
+test("tool update display defaults to widget-only updates when UI is available", () => {
+  const updates: unknown[] = [];
+  const widgets: Array<{ key: string; value: string[] | undefined }> = [];
+  const display = createToolUpdateWorkflowDisplay((update) => updates.push(update), {
+    hasUI: true,
+    ui: {
+      setWidget: (key: string, value: string[] | undefined) => widgets.push({ key, value }),
+      setStatus() {},
+    },
+  } as any);
+
+  display.update(snapshot({ agents: [agent({ status: "running" })] }));
+
+  assert.equal(updates.length, 0);
+  assert.equal(widgets.length, 1);
+  assert.equal(widgets[0]?.key, "workflow");
+  assert.ok(widgets[0]?.value?.join("\n").includes("Workflow: demo_workflow"));
+});
+
+test("tool update display can clear the widget when the workflow completes", () => {
+  const widgets: Array<{ key: string; value: string[] | undefined }> = [];
+  const display = createToolUpdateWorkflowDisplay(
+    undefined,
+    {
+      hasUI: true,
+      ui: {
+        setWidget: (key: string, value: string[] | undefined) => widgets.push({ key, value }),
+        setStatus() {},
+      },
+    } as any,
+    { clearWidgetOnComplete: true },
+  );
+
+  display.update(snapshot({ agents: [agent({ status: "running" })] }));
+  display.complete(snapshot({ agents: [agent({ status: "done" })] }));
+
+  assert.equal(widgets.at(-1)?.key, "workflow");
+  assert.equal(widgets.at(-1)?.value, undefined);
 });
