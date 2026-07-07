@@ -102,6 +102,31 @@ Rules:
 The orchestrator should coordinate. Put repository reads, shell commands, file
 edits, network checks, and tests inside subagent prompts.
 
+### Prompt design for fresh-context agents
+
+Each subagent starts with an empty conversation, so prompts must inline every
+piece of context the agent needs: file paths, code snippets, prior findings, and
+the task itself. Do not rely on earlier turns, tool output, or a cached file
+view from the parent orchestrator.
+
+Wrong:
+
+```js
+agent("Review the code above for race conditions.", { label: "review" });
+```
+
+Right:
+
+```js
+agent(
+  "Review this function for race conditions.\n\n" +
+    "File: src/queue.js\n" +
+    "Code:\n```js\n...\n```\n" +
+    "Known concern: enqueue and dequeue both mutate `tail` without locking.",
+  { label: "review" },
+);
+```
+
 ## 5. `agent()` Options
 
 ```js
@@ -186,6 +211,29 @@ const verified = await pipeline(
 
 Each stage receives `(previousValue, originalItem, index)`. If one stage throws,
 that item becomes `null` and later stages for that item are skipped.
+
+### Structured hand-off contracts
+
+Treat data passed between workflow stages as a small contract:
+
+(a) each hand-off JSON should carry exactly the fields the downstream agent needs;
+(b) always use `schema` on producing agents so consumers get named fields instead
+    of free text;
+(c) use null-safe reads on every hand-off (`result?.findings ?? []`);
+(d) when hand-offs grow large, pass summary statistics alongside raw items so
+    consumers can route work without parsing everything.
+
+```js
+const summary = {
+  total: items.length,
+  categories: countBy(items, "category"),
+  items: items.slice(0, 20),
+};
+const next = await agent(
+  `Triage these findings.\n\n${JSON.stringify(summary, null, 2)}`,
+  { label: "triage", schema: TRIAGE },
+);
+```
 
 ## 7. `args`, `cwd`, And `budget`
 

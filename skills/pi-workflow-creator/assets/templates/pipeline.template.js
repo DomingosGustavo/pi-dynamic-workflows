@@ -34,10 +34,11 @@ const output = await pipeline(
       label: `stage1:${index + 1}`,
       phase: "Stage 1",
       model: "opencode-go/deepseek-v4-flash",
+      // isolation: { mode: "worktree", dirty: "ignore", merge: "none" }, // read-only inspection
       schema: STAGE_1,
     }),
   (previous, item, index) =>
-    agent(`TODO: second-stage instruction.\n\nItem:\n${item}\nStage 1:\n${previous?.result ?? "missing"}`, {
+    agent(`TODO: second-stage instruction.\n\nItem:\n${item}\nStage 1 output (JSON):\n${JSON.stringify(previous ?? { result: "missing" }, null, 2)}`, {
       label: `stage2:${index + 1}`,
       phase: "Stage 2",
       model: "opencode-go/minimax-m3",

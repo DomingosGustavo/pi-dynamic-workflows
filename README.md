@@ -101,6 +101,16 @@ return { inventory, summary }
 
 Phases are discovered as the script runs, so conditional and loop-created phases work naturally. If a branch is skipped, its phase does not show up as an empty progress row.
 
+## Workflow design principles
+
+- Size each agent to one focused responsibility describable in a sentence or two; split prompts that contain multiple independent action verbs into separate agents.
+- Parallel writers need disjoint file ownership — never let two agents edit the same file. Sequence overlapping edits or use worktree isolation so changes do not collide.
+- Use a separate, independent agent (ideally a different model) to review an implementer's work; do not let the same agent implement and then judge its own output.
+- Prefer structured JSON hand-offs — put `opts.schema` on the producer and reference named fields in the consumer's prompt — instead of passing raw text dumps between agents.
+- Bound every loop with a maximum-rounds cap and a dry-streak break when a round produces no new results.
+
+Worked examples of each principle live in `skills/pi-workflow-creator/references/patterns.md`.
+
 ### Editor IntelliSense
 
 Reusable workflow files can opt into editor hints for workflow globals:
@@ -116,13 +126,15 @@ This declares `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `cwd`, an
 | Global | Description |
 | --- | --- |
 | `agent(prompt, opts)` | Spawn a subagent. Returns its final text or, with `opts.schema`, a validated object. |
-| `parallel(thunks)` | Run an array of `() => agent(...)` thunks concurrently. Results are returned in input order. |
-| `pipeline(items, ...stages)` | Run each item through sequential stages while items fan out. Each stage receives `(prev, original, index)`. |
+| `parallel(thunks)` | Run an array of `() => agent(...)` thunks concurrently. Results are returned in input order. Use as a barrier when all results are needed before the next step (synthesis, dedup, ranking). |
+| `pipeline(items, ...stages)` | Run each item through sequential stages while items fan out. Each stage receives `(prev, original, index)`. Use as the default multi-stage shape when each item can advance independently. |
 | `phase(title)` | Mark the current phase. Used for grouping in the live progress view. |
 | `log(message)` | Append a workflow-level log line. |
 | `args` | Optional JSON value passed in via the tool's `args` parameter. |
 | `cwd`, `process.cwd()` | Current working directory for subagents. |
 | `budget` | `{ total, spent(), remaining() }` token budget tracker. |
+
+Failed branches resolve to `null` — filter with `.filter(Boolean)` and log the gaps before passing results downstream.
 
 ### Trust and isolation
 

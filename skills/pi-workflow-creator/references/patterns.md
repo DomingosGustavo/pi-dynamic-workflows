@@ -65,6 +65,25 @@ const report = await agent(
 return { questionCount: clean.length, report };
 ```
 
+### Synthesis contract
+
+The synthesis agent receives a JSON array of structured objects. Each object
+should include at least `{ label, summary, findings }` so the synthesizer knows
+the source. It must return prioritized/deduped items, uncertainty call-outs, and
+concrete file references.
+
+Recommended prompt template:
+
+```text
+Synthesize these N reports into a prioritized action list. Deduplicate
+overlapping items, flag disagreements between sources, and include file
+references.
+```
+
+For high-stakes synthesis, use two independent judges (one
+`opencode-go/glm-5.2` reasoning judge, and one frontier judge such as
+`anthropic/claude-opus-4-8` or `openai-codex/gpt-5.5`) plus a reconciling agent.
+
 ## 2. Pipeline: Review Then Verify
 
 Use when each item should advance to the next stage as soon as it is ready. This
@@ -240,6 +259,13 @@ while (budget.total && budget.remaining() > 50_000 && rounds < 8) {
 return { rounds, found };
 ```
 
+### Choosing bounds
+
+Set conservative hard stops: discovery loops run at most ~8 rounds or collect
+~25 items; implement-review-fix loops run at most 3 rounds. Add a dry-streak
+break when consecutive rounds add nothing, and reserve budget for final
+synthesis.
+
 ## 6. Judge Panel
 
 Use when the solution space is broad or high stakes. Generate independent
@@ -300,3 +326,33 @@ return { final, ranked };
 
 Use the enabled GPT 5.5 provider/id in the local registry if it differs from
 `openai-codex/gpt-5.5`.
+
+## 7. Defensive null handling
+
+Failed branches return `null`. Defensive reads keep a workflow from crashing
+mid-run.
+
+Use `previous?.field ?? fallback` in every pipeline stage that reads a previous
+result:
+
+```js
+(review?.findings ?? []).forEach((finding) => { ... });
+```
+
+`results.filter(Boolean)` is necessary but not sufficient. Also log which
+branches failed so you can retry or report gaps:
+
+```js
+results.forEach((r, i) => {
+  if (!r) log(`branch ${labels[i]} returned null`);
+});
+```
+
+Provide fallback defaults:
+
+```js
+const items = result?.items ?? [];
+```
+
+Report known-failed branches in the synthesis prompt so the final output
+acknowledges gaps rather than silently omitting them.

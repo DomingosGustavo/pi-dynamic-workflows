@@ -4,7 +4,10 @@
 export const meta = {
   name: "todo_fanout",
   description: "TODO: process independent items in parallel, then synthesize",
-  phases: [{ title: "Work" }, { title: "Synthesize" }],
+  phases: [
+    { title: "Work", detail: "process each independent item in parallel" },
+    { title: "Synthesize", detail: "combine item results into one deliverable" },
+  ],
 };
 
 const input =
@@ -28,6 +31,9 @@ const ITEM_RESULT = {
   },
 };
 
+// These agents are read-only. For mutating agents, assign disjoint file ownership
+// and add isolation: { mode: "worktree", dirty: "patch", merge: "none" } per agent.
+
 phase("Work");
 const results = await parallel(
   items.map((item, index) => () =>
@@ -41,6 +47,9 @@ const results = await parallel(
 );
 
 const clean = results.map((result, index) => (result ? { item: items[index], ...result } : null)).filter(Boolean);
+
+// SYNTHESIS CONTRACT: clean is an array of { item, summary, points }.
+// The synthesizer must dedupe, prioritize, and return one combined report.
 
 phase("Synthesize");
 const report = await agent("TODO: combine these item results into one deliverable.\n\n" + JSON.stringify(clean, null, 2), {
