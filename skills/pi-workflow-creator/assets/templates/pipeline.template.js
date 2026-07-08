@@ -1,3 +1,5 @@
+// NOTE: model refs below are PLACEHOLDERS. Replace them with refs enabled in the
+// current Pi session; an unknown ref makes that agent() branch return null.
 // Run each item through ordered stages. Items advance independently.
 // Use this as the default shape for multi-stage work.
 

@@ -1,3 +1,5 @@
+// NOTE: model refs below are PLACEHOLDERS. Replace them with refs enabled in the
+// current Pi session; an unknown ref makes that agent() branch return null.
 // Parallel mutating agents with partitioned file ownership.
 //
 // Rule: never assign the same file to two agents in the same parallel batch.

@@ -97,13 +97,9 @@ export function usageFromSessionStats(stats: SessionStats | undefined): Workflow
     cacheRead: numberOrZero(stats.tokens.cacheRead),
     cacheWrite: numberOrZero(stats.tokens.cacheWrite),
     total: numberOrZero(stats.tokens.total),
-    cost: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      total: numberOrZero(stats.cost),
-    },
+    // Session stats only expose an aggregate cost; leave the per-bucket breakdown undefined
+    // (unknown) rather than reporting a misleading zero for each component.
+    cost: { total: numberOrZero(stats.cost) },
     turns: stats.assistantMessages,
   };
 }
@@ -123,12 +119,13 @@ export function sumWorkflowUsage(values: Array<WorkflowTokenUsage | undefined>):
       cacheRead: sum.cacheRead + usage.cacheRead,
       cacheWrite: sum.cacheWrite + usage.cacheWrite,
       total: sum.total + usage.total,
+      // Cost buckets may be undefined (unknown) when derived from session stats; coalesce to 0.
       cost: {
-        input: sum.cost.input + usage.cost.input,
-        output: sum.cost.output + usage.cost.output,
-        cacheRead: sum.cost.cacheRead + usage.cost.cacheRead,
-        cacheWrite: sum.cost.cacheWrite + usage.cost.cacheWrite,
-        total: sum.cost.total + usage.cost.total,
+        input: numberOrZero(sum.cost.input) + numberOrZero(usage.cost.input),
+        output: numberOrZero(sum.cost.output) + numberOrZero(usage.cost.output),
+        cacheRead: numberOrZero(sum.cost.cacheRead) + numberOrZero(usage.cost.cacheRead),
+        cacheWrite: numberOrZero(sum.cost.cacheWrite) + numberOrZero(usage.cost.cacheWrite),
+        total: numberOrZero(sum.cost.total) + numberOrZero(usage.cost.total),
       },
       turns: (sum.turns ?? 0) + (usage.turns ?? 0),
     }),
@@ -145,6 +142,7 @@ export function sumWorkflowUsage(values: Array<WorkflowTokenUsage | undefined>):
 }
 
 export function previewValue(value: unknown, max = DEFAULT_PREVIEW_MAX): string {
+  if (max <= 0) return "";
   if (value === undefined || value === null) return "";
   const text =
     typeof value === "string"

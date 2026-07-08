@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -11,7 +12,13 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import type { WorkflowApprovalMode, WorkflowReviewMetadata } from "./options.js";
-import { parseWorkflowScript, runWorkflow, type WorkflowMeta, type WorkflowRunResult } from "./workflow.js";
+import {
+  parseWorkflowScript,
+  runWorkflow,
+  type WorkflowMeta,
+  type WorkflowRunOptions,
+  type WorkflowRunResult,
+} from "./workflow.js";
 
 const workflowToolSchema = Type.Object({
   script: Type.String({
@@ -25,14 +32,20 @@ const workflowToolSchema = Type.Object({
   args: Type.Optional(
     Type.Any({ description: "Optional JSON value exposed to the workflow script as global `args`." }),
   ),
+  tokenBudget: Type.Optional(
+    Type.Union([Type.Number({ minimum: 0 }), Type.Null()], {
+      description: "Optional total token budget exposed as budget.total; null means unlimited.",
+    }),
+  ),
 });
 
 export type WorkflowToolInput = {
   script: string;
   args?: unknown;
+  tokenBudget?: number | null;
 };
 
-const workflowDisplayOptions = {
+const workflowDisplayOptions: WorkflowDisplayRunOptions = {
   key: "workflow",
   clearWidgetOnComplete: true,
   maxAgents: 6,
@@ -43,11 +56,177 @@ const workflowDisplayOptions = {
   showActivity: true,
   showPreviews: false,
   previewWidth: 104,
-} as const;
+};
+
+export interface WorkflowDisplayRunOptions {
+  key: string;
+  clearWidgetOnComplete: boolean;
+  maxAgents: number;
+  maxLogs: number;
+  showResultPreviews: boolean;
+  showModel: boolean;
+  showUsage: boolean;
+  showActivity: boolean;
+  showPreviews: boolean;
+  previewWidth: number;
+}
+
+export function defaultWorkflowDisplayOptions(key: string): WorkflowDisplayRunOptions {
+  return { ...workflowDisplayOptions, key };
+}
+
+export interface RunWorkflowScriptOptions {
+  cwd: string;
+  args?: unknown;
+  concurrency?: number;
+  tokenBudget?: number | null;
+  signal?: AbortSignal;
+  review?: WorkflowReviewMetadata;
+  displayOptions?: WorkflowDisplayRunOptions;
+  /** Injectable agent runner (tests). Defaults to a real WorkflowAgent. */
+  agent?: WorkflowRunOptions["agent"];
+  onUpdate?: Parameters<typeof createToolUpdateWorkflowDisplay>[0];
+  ctx: {
+    modelRegistry?: unknown;
+    model?: unknown;
+    ui?: unknown;
+    hasUI?: boolean;
+  };
+}
+
+/**
+ * Run a parsed workflow script with the shared live TUI wiring (snapshot,
+ * widget/tool-update display, per-agent telemetry). Used by both the
+ * `workflow` tool (after approval) and the `subagent` tool (no approval).
+ */
+export async function runWorkflowScriptWithDisplay(
+  script: string,
+  meta: WorkflowMeta,
+  options: RunWorkflowScriptOptions,
+): Promise<{ result: WorkflowRunResult; snapshot: WorkflowSnapshot }> {
+  const displayOptions = options.displayOptions ?? workflowDisplayOptions;
+  const review = options.review;
+  const signal = options.signal;
+  let snapshot: WorkflowSnapshot = { ...createWorkflowSnapshot(meta), review };
+  const display = createToolUpdateWorkflowDisplay(options.onUpdate, options.ctx as any, displayOptions);
+
+  const update = () => {
+    snapshot = recomputeWorkflowSnapshot(snapshot);
+    snapshot.review = review;
+    display.update(snapshot);
+  };
+
+  const recordPhase = (title: string | undefined) => {
+    if (!title) return;
+    if (!snapshot.phases.includes(title)) snapshot.phases.push(title);
+  };
+
+  let result: WorkflowRunResult;
+  try {
+    result = await runWorkflow(script, {
+      cwd: options.cwd,
+      args: options.args,
+      signal,
+      agent: options.agent,
+      concurrency: options.concurrency,
+      tokenBudget: options.tokenBudget,
+      session: {
+        modelRegistry: (options.ctx as any).modelRegistry,
+        model: (options.ctx as any).model,
+      },
+      onLog(message) {
+        snapshot.logs.push(message);
+        update();
+      },
+      onPhase(title) {
+        snapshot.currentPhase = title;
+        recordPhase(title);
+        update();
+      },
+      onAgentStart(event) {
+        if (signal?.aborted) throw createAbortError("Workflow was aborted");
+        recordPhase(event.phase);
+        snapshot.agents.push({
+          id: event.id,
+          label: event.label,
+          phase: event.phase,
+          prompt: event.prompt,
+          status: "running",
+          model: event.model,
+          thinkingLevel: event.thinkingLevel,
+          isolation: event.isolation,
+          promptPreview: preview(event.prompt, displayOptions.previewWidth),
+          activity: { kind: "starting", text: "starting", updatedAt: Date.now() },
+        });
+        update();
+      },
+      onAgentUpdate(event) {
+        const agent = findSnapshotAgent(snapshot, event.id, "running");
+        if (agent) {
+          agent.metadata = event.metadata;
+          agent.activity = event.metadata.activity;
+          agent.usage = event.metadata.usage;
+          agent.contextUsage = event.metadata.contextUsage;
+          agent.promptPreview = event.metadata.promptPreview ?? agent.promptPreview;
+          agent.outputPreview = event.metadata.outputPreview ?? agent.outputPreview;
+        }
+        update();
+      },
+      onAgentEnd(event) {
+        const agent = findSnapshotAgent(snapshot, event.id, "running");
+        const error = (event.metadata as { error?: { message: string } } | undefined)?.error;
+        if (agent) {
+          agent.status = error ? "error" : "done";
+          agent.error = error?.message;
+          agent.resultPreview = preview(event.result);
+          agent.metadata = event.metadata;
+          agent.activity = event.metadata?.activity ?? {
+            kind: agent.status === "done" ? "done" : "error",
+            text: agent.status === "done" ? "done" : "error",
+            updatedAt: Date.now(),
+          };
+          agent.usage = event.metadata?.usage;
+          agent.contextUsage = event.metadata?.contextUsage;
+          agent.promptPreview = event.metadata?.promptPreview ?? agent.promptPreview;
+          agent.outputPreview = event.metadata?.outputPreview ?? agent.resultPreview;
+        }
+        update();
+      },
+    });
+  } catch (error) {
+    if (isAbortError(error)) {
+      for (const agent of snapshot.agents) {
+        if (agent.status === "running") {
+          agent.status = "skipped";
+          agent.error = "aborted";
+        }
+      }
+      snapshot = recomputeWorkflowSnapshot(snapshot);
+      display.complete(snapshot);
+      throw createAbortError("Workflow was aborted");
+    }
+    throw error;
+  }
+
+  if (result.agentCount === 0) {
+    throw new Error(
+      "workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents",
+    );
+  }
+
+  snapshot.result = result.result;
+  snapshot.durationMs = result.durationMs;
+  snapshot.review = review;
+  snapshot = recomputeWorkflowSnapshot(snapshot);
+  display.complete(snapshot);
+
+  return { result, snapshot };
+}
 
 export interface WorkflowToolOptions {
   cwd?: string;
   concurrency?: number;
+  tokenBudget?: number | null;
   approvalMode?: WorkflowApprovalMode;
   reviewDir?: string;
 }
@@ -63,10 +242,10 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     promptSnippet:
       "Run a trusted JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Use phase(title) at runtime to create progress groups.",
     promptGuidelines: [
-      "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
+      "Use workflow when the user explicitly asks for a workflow, fan-out, or multi-agent orchestration, or when the task clearly decomposes into multiple agents (audits, multi-file changes, implement-then-review, fan-out research).",
       "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
       "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is optional metadata for a stable upfront outline.",
-      "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), or fs. Workflow JavaScript is trusted orchestration code under Pi's normal tool/session trust model.",
+      "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax or static import/export statements after the meta export. Workflow JavaScript is trusted orchestration code with full host privileges under Pi's normal tool/session trust model; approval is not a sandbox.",
       "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
       "For workflow, agent options may include model, thinkingLevel, and isolation. Prefer enabled model refs such as provider/id when the task benefits from different model strengths.",
       "For workflow, dynamically choose the workflow shape, phase names, number of agents, and model assignments from the user's goal and repository context; do not reuse a fixed template when the task calls for a different decomposition.",
@@ -113,7 +292,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         },
       });
 
-      if (signal?.aborted) throw new Error("Workflow was aborted");
+      if (signal?.aborted) throw createAbortError("Workflow was aborted");
 
       if (approvalMode === "interactive") {
         if (!ctx.hasUI) {
@@ -127,6 +306,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
             `Review file: ${review.path}`,
             "",
             `Run workflow "${parsed.meta.name}" now?`,
+            "This trusted JavaScript runs with full host privileges; approval is not a sandbox.",
             "Rejecting leaves the review file in place and starts no agents.",
           ].join("\n"),
           signal ? { signal } : undefined,
@@ -159,114 +339,16 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         review = { ...review, approved: true, status: "auto" };
       }
 
-      let snapshot: WorkflowSnapshot = { ...createWorkflowSnapshot(parsed.meta), review };
-      const display = createToolUpdateWorkflowDisplay(onUpdate, ctx, workflowDisplayOptions);
-
-      const update = () => {
-        snapshot = recomputeWorkflowSnapshot(snapshot);
-        snapshot.review = review;
-        display.update(snapshot);
-      };
-
-      const recordPhase = (title: string | undefined) => {
-        if (!title) return;
-        if (!snapshot.phases.includes(title)) snapshot.phases.push(title);
-      };
-
-      let result: WorkflowRunResult;
-      try {
-        result = await runWorkflow(script, {
-          cwd,
-          args: params.args,
-          signal,
-          concurrency: options.concurrency,
-          session: {
-            modelRegistry: ctx.modelRegistry,
-            model: ctx.model,
-          },
-          onLog(message) {
-            snapshot.logs.push(message);
-            update();
-          },
-          onPhase(title) {
-            snapshot.currentPhase = title;
-            recordPhase(title);
-            update();
-          },
-          onAgentStart(event) {
-            if (signal?.aborted) throw new Error("Workflow was aborted");
-            recordPhase(event.phase);
-            snapshot.agents.push({
-              id: snapshot.agents.length + 1,
-              label: event.label,
-              phase: event.phase,
-              prompt: event.prompt,
-              status: "running",
-              model: event.model,
-              thinkingLevel: event.thinkingLevel,
-              isolation: event.isolation,
-              promptPreview: preview(event.prompt, workflowDisplayOptions.previewWidth),
-              activity: { kind: "starting", text: "starting", updatedAt: Date.now() },
-            });
-            update();
-          },
-          onAgentUpdate(event) {
-            const agent = findSnapshotAgent(snapshot, event.label, "running");
-            if (agent) {
-              agent.metadata = event.metadata;
-              agent.activity = event.metadata.activity;
-              agent.usage = event.metadata.usage;
-              agent.contextUsage = event.metadata.contextUsage;
-              agent.promptPreview = event.metadata.promptPreview ?? agent.promptPreview;
-              agent.outputPreview = event.metadata.outputPreview ?? agent.outputPreview;
-            }
-            update();
-          },
-          onAgentEnd(event) {
-            const agent = findSnapshotAgent(snapshot, event.label, "running");
-            if (agent) {
-              agent.status = event.result === null ? "error" : "done";
-              agent.resultPreview = preview(event.result);
-              agent.metadata = event.metadata;
-              agent.activity = event.metadata?.activity ?? {
-                kind: agent.status === "done" ? "done" : "error",
-                text: agent.status === "done" ? "done" : "error",
-                updatedAt: Date.now(),
-              };
-              agent.usage = event.metadata?.usage;
-              agent.contextUsage = event.metadata?.contextUsage;
-              agent.promptPreview = event.metadata?.promptPreview ?? agent.promptPreview;
-              agent.outputPreview = event.metadata?.outputPreview ?? agent.resultPreview;
-            }
-            update();
-          },
-        });
-      } catch (error) {
-        if (signal?.aborted || isAbortError(error)) {
-          for (const agent of snapshot.agents) {
-            if (agent.status === "running") {
-              agent.status = "skipped";
-              agent.error = "aborted";
-            }
-          }
-          snapshot = recomputeWorkflowSnapshot(snapshot);
-          display.complete(snapshot);
-          throw new Error("Workflow was aborted");
-        }
-        throw error;
-      }
-
-      if (result.agentCount === 0) {
-        throw new Error(
-          "workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents",
-        );
-      }
-
-      snapshot.result = result.result;
-      snapshot.durationMs = result.durationMs;
-      snapshot.review = review;
-      snapshot = recomputeWorkflowSnapshot(snapshot);
-      display.complete(snapshot);
+      const { result, snapshot } = await runWorkflowScriptWithDisplay(script, parsed.meta, {
+        cwd,
+        args: params.args,
+        concurrency: options.concurrency,
+        tokenBudget: params.tokenBudget !== undefined ? params.tokenBudget : options.tokenBudget,
+        signal,
+        review,
+        onUpdate,
+        ctx,
+      });
 
       return {
         content: [
@@ -282,6 +364,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           logs: result.logs,
           result: result.result,
           durationMs: result.durationMs,
+          agentRecords: result.agents,
           review,
         },
       };
@@ -300,7 +383,18 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
   if (!args || typeof args !== "object") throw new Error("workflow requires an object argument with a script string");
   const value = args as Record<string, unknown>;
   if (typeof value.script !== "string") throw new Error("workflow requires `script` to be a string");
-  return { ...value, script: normalizeWorkflowScript(value.script) } as WorkflowToolInput;
+  return {
+    ...value,
+    script: normalizeWorkflowScript(value.script),
+    tokenBudget: normalizeTokenBudget(value.tokenBudget),
+  } as WorkflowToolInput;
+}
+
+function normalizeTokenBudget(value: unknown): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  throw new Error("workflow tokenBudget must be a non-negative finite number or null");
 }
 
 function normalizeWorkflowScript(script: string): string {
@@ -321,14 +415,11 @@ export async function prepareWorkflowReview(
   },
 ): Promise<WorkflowReviewMetadata> {
   const normalized = normalizeWorkflowScript(script);
-  const reviewScript = normalized.endsWith("\n") ? normalized : `${normalized}\n`;
+  const scriptBody = normalized.endsWith("\n") ? normalized : `${normalized}\n`;
+  const reviewScript = `${workflowReviewHeader()}${scriptBody}`;
   const dir = resolveWorkflowReviewDir(cwd, options.reviewDir);
   await mkdir(dir, { recursive: true });
-  const path = join(
-    dir,
-    `${formatReviewTimestamp(options.now ?? new Date())}-${slugWorkflowName(meta.name)}.workflow.js`,
-  );
-  await writeFile(path, reviewScript, "utf8");
+  const path = await writeWorkflowReviewFile(dir, options.now ?? new Date(), slugWorkflowName(meta.name), reviewScript);
   return {
     path,
     script: reviewScript,
@@ -336,6 +427,39 @@ export async function prepareWorkflowReview(
     approvalMode: options.approvalMode,
     status: "pending",
   };
+}
+
+function workflowReviewHeader(): string {
+  return [
+    "// Pi workflow review artifact.",
+    "// TRUST: this trusted JavaScript runs with full host privileges, not inside a sandbox.",
+    "// globalThis, Function, dynamic import(), and host APIs may be reachable.",
+    "",
+  ].join("\n");
+}
+
+async function writeWorkflowReviewFile(dir: string, now: Date, slug: string, script: string): Promise<string> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const path = join(dir, workflowReviewFilename(now, slug, attempt));
+    try {
+      await writeFile(path, script, { encoding: "utf8", flag: "wx" });
+      return path;
+    } catch (error) {
+      if (!isFileExistsError(error)) throw error;
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+function workflowReviewFilename(now: Date, slug: string, attempt: number): string {
+  if (attempt === 0) return `${formatReviewTimestamp(now)}-${slug}.workflow.js`;
+  return `${formatReviewTimestampWithMilliseconds(now)}-${slug}-${randomUUID().slice(0, 8)}.workflow.js`;
+}
+
+function isFileExistsError(error: unknown): boolean {
+  return !!error && typeof error === "object" && (error as { code?: unknown }).code === "EEXIST";
 }
 
 function resolveWorkflowReviewDir(cwd: string, reviewDir?: string): string {
@@ -362,6 +486,13 @@ function formatReviewTimestamp(now: Date): string {
     .replace(/\.\d{3}Z$/, "Z");
 }
 
+function formatReviewTimestampWithMilliseconds(now: Date): string {
+  return now
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.(\d{3})Z$/, "$1Z");
+}
+
 function renderWorkflowReviewText(meta: WorkflowMeta, review: WorkflowReviewMetadata): string {
   return [
     "Workflow ready for review",
@@ -371,6 +502,7 @@ function renderWorkflowReviewText(meta: WorkflowMeta, review: WorkflowReviewMeta
     review.script.trimEnd(),
     "```",
     "",
+    "Trust: this script runs as trusted JavaScript with full host privileges; approval is not a sandbox.",
     review.approvalMode === "auto"
       ? "approvalMode is auto; trusted automation will run this workflow after review metadata is recorded."
       : "Approve the confirmation prompt to run this workflow.",
@@ -378,14 +510,19 @@ function renderWorkflowReviewText(meta: WorkflowMeta, review: WorkflowReviewMeta
   ].join("\n");
 }
 
-function isAbortError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return /\babort(?:ed)?\b/i.test(error.message);
+function createAbortError(message: string): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
 }
 
-function findSnapshotAgent(snapshot: WorkflowSnapshot, label: string, status?: "running") {
-  return [...snapshot.agents].reverse().find((agent) => {
-    if (agent.label !== label) return false;
+function isAbortError(error: unknown): boolean {
+  return !!error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError";
+}
+
+function findSnapshotAgent(snapshot: WorkflowSnapshot, id: number, status?: "running") {
+  return snapshot.agents.find((agent) => {
+    if (agent.id !== id) return false;
     return status ? agent.status === status : true;
   });
 }

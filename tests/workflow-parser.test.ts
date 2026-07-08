@@ -40,6 +40,56 @@ test("parseWorkflowScript requires name and description", () => {
   assert.throws(() => parseWorkflowScript("export const meta = { description: 'desc' }"), /meta.name/);
 });
 
+test("parseWorkflowScript rejects malformed meta exports", () => {
+  assert.throws(
+    () => parseWorkflowScript("export let meta = { name: 'demo', description: 'desc' }"),
+    /meta export must be `export const meta = \.\.\.`/,
+  );
+  assert.throws(
+    () => parseWorkflowScript("export var meta = { name: 'demo', description: 'desc' }"),
+    /meta export must be `export const meta = \.\.\.`/,
+  );
+  assert.throws(
+    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc' }, extra = 1"),
+    /meta export must declare only `meta`/,
+  );
+  assert.throws(
+    () => parseWorkflowScript("export const notMeta = { name: 'demo', description: 'desc' }"),
+    /meta export must declare `meta`/,
+  );
+  assert.throws(() => parseWorkflowScript("export const meta"), /Missing initializer|Unexpected token/);
+});
+
+test("parseWorkflowScript validates optional metadata shapes", () => {
+  assert.throws(
+    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc', whenToUse: 42 }"),
+    /meta\.whenToUse must be a string/,
+  );
+  assert.throws(
+    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc', phases: 'Scan' }"),
+    /meta\.phases must be an array/,
+  );
+  assert.throws(
+    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc', phases: [{}] }"),
+    /each meta phase must have a title string/,
+  );
+  assert.throws(
+    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc', phases: [{ title: 123 }] }"),
+    /each meta phase must have a title string/,
+  );
+});
+
+test("parseWorkflowScript rejects module syntax after the meta export", () => {
+  assert.throws(
+    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc' }\nimport fs from 'node:fs'"),
+    /do not support import\/export statements after the meta export/,
+  );
+  assert.throws(
+    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc' }\nexport const value = 1"),
+    /do not support import\/export statements after the meta export/,
+  );
+});
+
 test("parseWorkflowScript rejects non-literal metadata", () => {
   assert.throws(
     () => parseWorkflowScript("export const meta = { name: makeName(), description: 'desc' }"),

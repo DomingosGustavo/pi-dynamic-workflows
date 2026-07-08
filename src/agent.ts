@@ -124,24 +124,29 @@ export class WorkflowAgent {
       let removeAbortListener: (() => void) | undefined;
       let unsubscribe: (() => void) | undefined;
       try {
-        if (options.signal?.aborted) throw new Error("Subagent was aborted");
+        if (options.signal?.aborted) throw createAbortError();
         if (options.signal) {
-          const onAbort = () => void session.abort();
+          // session.abort() may reject if there is nothing in flight; ignore that explicitly.
+          const onAbort = () => void Promise.resolve(session.abort()).catch(() => {});
           options.signal.addEventListener("abort", onAbort, { once: true });
           removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
         }
 
         unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+          if (options.schema) trackStructuredOutputAttempt(event, capture);
           const update = workflowTelemetryFromSessionEvent(event);
+          // Live usage from a single assistant message undercounts multi-turn runs; recompute
+          // the cumulative total from all messages so live totals stay monotonic and match finals.
+          if (update.usage) update.usage = usageFromMessages(session.messages) ?? update.usage;
           if (Object.keys(update).length > 0) emitUpdate(update);
         });
 
         await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
-        if (options.signal?.aborted) throw new Error("Subagent was aborted");
+        if (options.signal?.aborted) throw createAbortError();
 
         if (options.schema) {
           if (!capture.called) {
-            throw new Error("Subagent finished without calling structured_output");
+            throw new Error(this.structuredOutputFailureMessage(capture));
           }
           this.recordFinalMetadata(session, metadata, capture.value);
           emitUpdate();
@@ -202,6 +207,15 @@ export class WorkflowAgent {
     return "";
   }
 
+  private structuredOutputFailureMessage(capture: StructuredOutputCapture<any>): string {
+    const attempts = capture.attempts ?? 0;
+    if (attempts === 0) {
+      return "Subagent finished without calling structured_output";
+    }
+    const detail = capture.lastError ? `; last validation error: ${capture.lastError}` : "";
+    return `Subagent finished without a valid structured_output result after ${attempts} invalid attempt(s)${detail}`;
+  }
+
   private recordFinalMetadata(session: AgentSession, metadata: WorkflowAgentRunMetadata, output: unknown): void {
     const stats = session.getSessionStats();
     const usage = usageFromMessages(session.messages) ?? usageFromSessionStats(stats);
@@ -210,6 +224,45 @@ export class WorkflowAgent {
     metadata.outputPreview = previewValue(output);
     metadata.activity = { kind: "done", text: "done", updatedAt: Date.now() };
   }
+}
+
+function createAbortError(message = "Subagent was aborted"): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+/**
+ * Track structured_output tool calls that Pi rejected for failing schema validation.
+ *
+ * Invalid arguments never reach the tool's execute(), so capture.called stays false. Pi still
+ * emits a tool_execution_end for structured_output with isError=true, letting us distinguish
+ * "never tried" from "tried but invalid" in the final failure message.
+ */
+function trackStructuredOutputAttempt(event: AgentSessionEvent, capture: StructuredOutputCapture<any>): void {
+  if (event.type !== "tool_execution_end") return;
+  if (event.toolName !== "structured_output" || !event.isError) return;
+  capture.attempts = (capture.attempts ?? 0) + 1;
+  const message = errorTextFromToolResult(event.result);
+  if (message) capture.lastError = message;
+}
+
+function errorTextFromToolResult(result: unknown): string | undefined {
+  if (typeof result === "string") return result;
+  const content = (result as { content?: unknown })?.content;
+  if (Array.isArray(content)) {
+    const text = content
+      .filter(
+        (part): part is { type: "text"; text: string } =>
+          !!part &&
+          (part as { type?: unknown }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string",
+      )
+      .map((part) => part.text)
+      .join("");
+    if (text.trim()) return text.trim();
+  }
+  return undefined;
 }
 
 export function resolveWorkflowModel(

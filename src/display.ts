@@ -44,6 +44,7 @@ export interface WorkflowSnapshot {
   runningCount: number;
   doneCount: number;
   errorCount: number;
+  skippedCount: number;
   durationMs?: number;
   usage?: WorkflowTokenUsage;
   review?: WorkflowReviewMetadata;
@@ -81,6 +82,7 @@ export function createWorkflowSnapshot(meta: WorkflowMeta): WorkflowSnapshot {
     runningCount: 0,
     doneCount: 0,
     errorCount: 0,
+    skippedCount: 0,
   };
 }
 
@@ -88,8 +90,17 @@ export function recomputeWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowS
   const runningCount = snapshot.agents.filter((agent) => agent.status === "running").length;
   const doneCount = snapshot.agents.filter((agent) => agent.status === "done").length;
   const errorCount = snapshot.agents.filter((agent) => agent.status === "error").length;
+  const skippedCount = snapshot.agents.filter((agent) => agent.status === "skipped").length;
   const usage = sumWorkflowUsage(snapshot.agents.map((agent) => agent.usage ?? agent.metadata?.usage));
-  return { ...snapshot, agentCount: snapshot.agents.length, runningCount, doneCount, errorCount, usage };
+  return {
+    ...snapshot,
+    agentCount: snapshot.agents.length,
+    runningCount,
+    doneCount,
+    errorCount,
+    skippedCount,
+    usage,
+  };
 }
 
 export function createWidgetWorkflowDisplay(
@@ -163,35 +174,46 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
   const showUsage = options.showUsage ?? false;
   const showActivity = options.showActivity ?? false;
   const showPreviews = options.showPreviews ?? false;
-  const state =
-    snapshot.errorCount > 0
-      ? `, ${snapshot.errorCount} errors`
-      : snapshot.runningCount > 0
-        ? `, ${snapshot.runningCount} running`
-        : "";
+  const state = [
+    snapshot.errorCount > 0 ? `, ${snapshot.errorCount} errors` : "",
+    snapshot.runningCount > 0 ? `, ${snapshot.runningCount} running` : "",
+    snapshot.skippedCount > 0 ? `, ${snapshot.skippedCount} skipped` : "",
+  ].join("");
   const headerUsage = showUsage ? formatUsage(snapshot.usage) : undefined;
   const lines = [
     `◆ Workflow: ${snapshot.name} (${snapshot.doneCount}/${snapshot.agentCount} done${state})${headerUsage ? ` · ${headerUsage}` : ""}`,
   ];
 
-  const agentPhaseNames = snapshot.agents
-    .map((agent) => agent.phase)
-    .filter((phase): phase is string => Boolean(phase));
-  const phaseNames = unique([
-    ...snapshot.phases,
-    ...(snapshot.currentPhase ? [snapshot.currentPhase] : []),
-    ...agentPhaseNames,
-  ]);
+  // Single pass: bucket agents by phase (preserving append order) and tally per-phase counts,
+  // instead of re-filtering the agent list once per phase.
+  const byPhase = new Map<string, PhaseBucket>();
+  const bucketFor = (phase: string): PhaseBucket => {
+    let bucket = byPhase.get(phase);
+    if (!bucket) {
+      bucket = { agents: [], done: 0, running: 0, errors: 0, skipped: 0 };
+      byPhase.set(phase, bucket);
+    }
+    return bucket;
+  };
+  // Seed declared phases (and current phase) so empty-but-current phases can still render.
+  for (const phase of snapshot.phases) bucketFor(phase);
+  if (snapshot.currentPhase) bucketFor(snapshot.currentPhase);
+  for (const agent of snapshot.agents) {
+    if (!agent.phase) continue;
+    const bucket = bucketFor(agent.phase);
+    bucket.agents.push(agent);
+    if (agent.status === "done") bucket.done++;
+    else if (agent.status === "running") bucket.running++;
+    else if (agent.status === "error") bucket.errors++;
+    else if (agent.status === "skipped") bucket.skipped++;
+  }
   const rendered = new Set<WorkflowAgentSnapshot>();
 
-  for (const phase of phaseNames) {
-    const agents = snapshot.agents.filter((agent) => agent.phase === phase);
+  for (const [phase, bucket] of byPhase) {
+    const agents = bucket.agents;
     if (agents.length === 0 && snapshot.currentPhase !== phase) continue;
     for (const agent of agents) rendered.add(agent);
-    const done = agents.filter((agent) => agent.status === "done").length;
-    const running = agents.filter((agent) => agent.status === "running").length;
-    const errors = agents.filter((agent) => agent.status === "error").length;
-    const skipped = agents.filter((agent) => agent.status === "skipped").length;
+    const { done, running, errors, skipped } = bucket;
     const complete = agents.length > 0 && done + errors + skipped === agents.length;
     const marker = running > 0 || (!complete && snapshot.currentPhase === phase) ? "▶" : complete ? "✓" : " ";
     lines.push(
@@ -239,12 +261,21 @@ export function renderWorkflowText(
   return [header, ...renderWorkflowLines(snapshot, options)].join("\n");
 }
 
+interface PhaseBucket {
+  agents: WorkflowAgentSnapshot[];
+  done: number;
+  running: number;
+  errors: number;
+  skipped: number;
+}
+
 function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {
   const usage = snapshot.usage ? ` · ${formatUsage(snapshot.usage)}` : "";
-  if (completed) return `workflow ✓ ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount}${usage}`;
+  const skipped = snapshot.skippedCount > 0 ? `, ${snapshot.skippedCount} skipped` : "";
+  if (completed) return `workflow ✓ ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount}${skipped}${usage}`;
   if (snapshot.runningCount > 0)
-    return `workflow ${snapshot.name}: ${snapshot.runningCount} running, ${snapshot.doneCount}/${snapshot.agentCount} done${usage}`;
-  return `workflow ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount} done${usage}`;
+    return `workflow ${snapshot.name}: ${snapshot.runningCount} running, ${snapshot.doneCount}/${snapshot.agentCount} done${skipped}${usage}`;
+  return `workflow ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount} done${skipped}${usage}`;
 }
 
 function statusIcon(status: WorkflowAgentStatus): string {
@@ -262,11 +293,8 @@ function statusIcon(status: WorkflowAgentStatus): string {
   }
 }
 
-function unique(values: string[]): string[] {
-  return [...new Set(values)];
-}
-
 function shorten(value: string, max: number): string {
+  if (max <= 0) return "";
   const text = value.replace(/\s+/g, " ").trim();
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }

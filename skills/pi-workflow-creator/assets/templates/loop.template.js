@@ -1,3 +1,5 @@
+// NOTE: model refs below are PLACEHOLDERS. Replace them with refs enabled in the
+// current Pi session; an unknown ref makes that agent() branch return null.
 // Keep spawning agents until a goal is met. Always include a hard stop.
 
 export const meta = {

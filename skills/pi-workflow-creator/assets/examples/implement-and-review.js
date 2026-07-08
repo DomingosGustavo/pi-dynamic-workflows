@@ -2,6 +2,9 @@
  * implement-and-review - implement a task, then loop review/fix until it passes.
  *
  * Shape: bounded loop. The hard round cap prevents unbounded agent calls.
+ *
+ * NOTE: model refs below are PLACEHOLDERS. Replace them with refs enabled in the
+ * current Pi session; an unknown ref makes that agent() branch return null.
  */
 
 export const meta = {

@@ -29,7 +29,7 @@ declare global {
     label?: string;
     /** Override the current runtime phase for this agent. */
     phase?: string;
-    /** JSON Schema for structured output. When present, the returned value is typed as unknown unless you provide a generic. */
+    /** JSON Schema for structured output. When present, the subagent returns a validated object instead of text. TypeScript cannot infer its shape from the schema literal, so annotate the result or pass a generic: `await agent<Finding>(prompt, { schema })`. */
     schema?: TSchema;
     /** Requested Pi model for this subagent. Use provider/id when possible, for example `opencode-go/deepseek-v4-flash`. */
     model?: WorkflowModelRef;
@@ -37,7 +37,12 @@ declare global {
     thinkingLevel?: WorkflowThinkingLevel;
     /** Requested isolation mode. Worktree isolation is opt-in and does not merge changes back. */
     isolation?: WorkflowWorktreeIsolation;
-    /** Requested subagent role/type. */
+    /**
+     * Free-text role hint for the subagent. This does not select a registered
+     * agent implementation; it only appends a line to the subagent instructions
+     * (`Act as workflow subagent type: <agentType>`). Use a normal descriptive
+     * string such as "security reviewer".
+     */
     agentType?: string;
   }
 
@@ -87,8 +92,20 @@ declare global {
     remaining(): number;
   }
 
-  /** Spawn a subagent. Returns final text unless a structured-output schema is used with an explicit generic. */
-  function agent<T = string>(prompt: string, options?: WorkflowAgentOptions): Promise<T>;
+  /**
+   * Spawn a subagent.
+   *
+   * Without `schema`, resolves to the subagent's final text (`string`).
+   * With `schema`, resolves to the validated structured object; because the
+   * default type parameter is `string` and options are non-generic, the schema
+   * gives no automatic inference — pass the expected result type explicitly:
+   * `await agent<MyResult>(prompt, { schema })`.
+   *
+   * A failed branch resolves to `null` (a structured error record is attached to
+   * the agent's run metadata), so downstream reads should be null-safe.
+   */
+  function agent(prompt: string): Promise<string>;
+  function agent<T = string>(prompt: string, options: WorkflowAgentOptions): Promise<T>;
 
   /** Run independent async tasks concurrently. Pass functions, not already-created promises. */
   function parallel<T>(thunks: Array<() => Promise<T>>): Promise<T[]>;
@@ -104,6 +121,14 @@ declare global {
 
   /** Append a workflow-level log line. */
   function log(message: unknown): void;
+
+  /** Console shim routed to workflow logs (`log`, `info`, `warn`, `error`). */
+  const console: {
+    log(...args: unknown[]): void;
+    info(...args: unknown[]): void;
+    warn(...args: unknown[]): void;
+    error(...args: unknown[]): void;
+  };
 
   /** Optional JSON args passed to the workflow tool. Narrow with a local type assertion when needed. */
   const args: unknown;

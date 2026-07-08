@@ -1,3 +1,5 @@
+// NOTE: model refs below are PLACEHOLDERS. Replace them with refs enabled in the
+// current Pi session; an unknown ref makes that agent() branch return null.
 // Fan out over a known list, then synthesize from all results.
 // Use this when the final step genuinely needs the complete result set.
 

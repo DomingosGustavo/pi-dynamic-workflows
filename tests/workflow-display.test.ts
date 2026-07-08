@@ -20,6 +20,7 @@ function snapshot(overrides: Partial<WorkflowSnapshot> = {}): WorkflowSnapshot {
     runningCount: 0,
     doneCount: 0,
     errorCount: 0,
+    skippedCount: 0,
     ...overrides,
   });
 }

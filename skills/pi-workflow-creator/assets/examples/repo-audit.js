@@ -3,6 +3,9 @@
  *
  * Shape: fan-out barrier, because final prioritization needs all inspection
  * reports together.
+ *
+ * NOTE: model refs below are PLACEHOLDERS. Replace them with refs enabled in the
+ * current Pi session; an unknown ref makes that agent() branch return null.
  */
 
 export const meta = {

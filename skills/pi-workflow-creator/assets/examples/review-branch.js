@@ -3,6 +3,9 @@
  *
  * Shape: pipeline. Findings from one dimension can verify while other
  * dimensions are still reviewing.
+ *
+ * NOTE: model refs below are PLACEHOLDERS. Replace them with refs enabled in the
+ * current Pi session; an unknown ref makes that agent() branch return null.
  */
 
 export const meta = {

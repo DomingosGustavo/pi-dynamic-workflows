@@ -1,3 +1,5 @@
+// NOTE: model refs below are PLACEHOLDERS. Replace them with refs enabled in the
+// current Pi session; an unknown ref makes that agent() branch return null.
 // Generate independent drafts, score them with independent judges, then synthesize.
 // Use this when the solution space is broad or the stakes are high.
 

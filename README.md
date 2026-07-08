@@ -20,11 +20,32 @@ Then in Pi:
 /reload
 ```
 
-That's it. The extension registers a `workflow` tool and activates it on session start.
+That's it. The extension registers a `workflow` tool and a `subagent` tool and activates them on session start. It also appends a short `## Delegation` section to the system prompt so the parent model knows when to hand work off to `subagent` (single task, no approval) versus `workflow` (multi-agent orchestration).
+
+## Subagent tool
+
+`subagent` is the lightweight sibling of `workflow`: one narrow, self-contained task delegated to a single agent, with no approval prompt. It is the right tool when a full multi-agent workflow is overkill but the task is still worth handing off.
+
+The caller (the parent model) picks the model and thinking level per the same model-selection guidelines the workflow tool uses — e.g. `opencode-go/kimi-k2.7-code` at `medium` for routine implementation, `openai-codex/gpt-5.5` or `anthropic/claude-opus-4-8` at `high` for frontier-difficulty debugging or architecture.
+
+Under the hood it reuses the exact same machinery as `workflow`:
+
+- it generates a one-agent workflow script and writes it to `.pi/workflows/` as an inspectable artifact (auto-approved, no confirmation prompt),
+- the task prompt is passed via `args.task`, and the agent runs as a fresh in-memory Pi subagent session with the standard coding tools,
+- live progress renders in the same TUI panel as workflows (model, thinking level, activity, token/cost usage),
+- `Esc` aborts the run like any workflow.
+
+```text
+◆ Workflow: subagent_summarize_exports (1/1 done) · 9.2k tok in 7.1k out 2.1k $0.0061
+  ✓ Task 1/1
+    #1 ✓ summarize exports · opencode-go/kimi-k2.7-code · medium · done · 9.2k tok
+```
+
+Task prompts must be self-contained: the subagent does not inherit the parent conversation.
 
 ## Workflow Creator Skill
 
-This repo includes a Codex skill at `skills/pi-workflow-creator` for designing Pi workflow scripts. Invoke it as
+This repo includes a Pi skill at `skills/pi-workflow-creator` for designing Pi workflow scripts. Invoke it as
 `$pi-workflow-creator` when you want the parent model to choose the workflow topology, model mix, structured output
 schemas, and isolation strategy before generating a `workflow` tool script.
 
@@ -132,9 +153,10 @@ This declares `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `cwd`, an
 | `log(message)` | Append a workflow-level log line. |
 | `args` | Optional JSON value passed in via the tool's `args` parameter. |
 | `cwd`, `process.cwd()` | Current working directory for subagents. |
-| `budget` | `{ total, spent(), remaining() }` token budget tracker. |
+| `budget` | `{ total, spent(), remaining() }` token budget tracker. `total` is the tool's `tokenBudget` input (non-null when provided) or `null`. |
+| `console` | `log`/`info`/`warn`/`error` routed to workflow logs. |
 
-Failed branches resolve to `null` — filter with `.filter(Boolean)` and log the gaps before passing results downstream.
+Failed branches resolve to `null` — filter with `.filter(Boolean)` and log the gaps before passing results downstream. A failed agent still records a structured error (`{ name, message, stack? }`) on its run metadata, so the failure stays inspectable in the workflow artifacts. Aborting a run (for example with `Esc`) rejects in-flight agents with an `AbortError` and stops the whole workflow rather than turning aborts into `null` branches.
 
 ### Trust and isolation
 
@@ -206,6 +228,7 @@ Subagents run in fresh in-memory Pi sessions with the standard coding tools, so 
 | --- | --- |
 | `src/workflow.ts` | Literal metadata parser and trusted workflow runtime. |
 | `src/workflow-tool.ts` | The Pi `workflow` tool, prompt guidelines, rendering, abort handling. |
+| `src/subagent-tool.ts` | The Pi `subagent` tool: no-approval single-agent runs through the shared workflow runtime, plus the delegation system-prompt append. |
 | `src/agent.ts` | `WorkflowAgent`, an in-memory Pi subagent runner. |
 | `src/worktree.ts` | Opt-in Git worktree isolation for subagents. |
 | `src/structured-output.ts` | Terminating structured-output tool backed by TypeBox/JSON Schema. |
@@ -218,7 +241,7 @@ Subagents run in fresh in-memory Pi sessions with the standard coding tools, so 
 ```bash
 npm install
 npm test     # biome check + tsc + unit tests
-npm run test:e2e:fintrack  # opt-in live Pi model workflow test against /home/gustavo/fintrack
+npm run test:e2e:fintrack  # opt-in live Pi model workflow test against a real repo
 npm run dev
 ```
 

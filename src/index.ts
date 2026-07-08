@@ -33,6 +33,14 @@ export type {
 } from "./options.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
+export type { SubagentToolInput, SubagentToolOptions } from "./subagent-tool.js";
+export {
+  buildDelegationPromptAppend,
+  buildSubagentScript,
+  createSubagentTool,
+  DELEGATION_PROMPT_APPEND,
+  DELEGATION_PROMPT_MARKER,
+} from "./subagent-tool.js";
 export {
   activityFromSessionEvent,
   contextUsageFromSessionStats,
@@ -50,6 +58,13 @@ export type {
   WorkflowRunResult,
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
-export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
-export { createWorkflowTool, prepareWorkflowReview, slugWorkflowName } from "./workflow-tool.js";
-export { normalizeWorktreeIsolation, WorkflowWorktreeManager } from "./worktree.js";
+export type { RunWorkflowScriptOptions, WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
+export {
+  createWorkflowTool,
+  defaultWorkflowDisplayOptions,
+  prepareWorkflowReview,
+  runWorkflowScriptWithDisplay,
+  slugWorkflowName,
+} from "./workflow-tool.js";
+export type { ActiveWorkflowWorktree } from "./worktree.js";
+export { normalizeWorktreeIsolation, pruneStale, WorkflowWorktreeManager } from "./worktree.js";

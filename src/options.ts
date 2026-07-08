@@ -7,6 +7,14 @@ export type WorkflowModelRef =
 
 export type WorkflowThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+/**
+ * Isolate an agent in a temporary Git worktree.
+ *
+ * dirty: 'patch' copies untracked files and applies `git diff --binary HEAD`.
+ * It does not distinctly reproduce deletions vs staged-index state, and
+ * deleted-then-recreated paths can be double-applied by the untracked copy plus
+ * HEAD diff. Patch mode is supported only when baseRef is HEAD.
+ */
 export type WorktreeIsolation =
   | "none"
   | "worktree"
@@ -30,10 +38,13 @@ export interface WorkflowWorktreeMetadata {
 }
 
 export interface WorkflowCostUsage {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
+  // Per-bucket costs are optional: session-stats-derived usage only knows the
+  // aggregate `total`, so the breakdown is left undefined (unknown) rather than
+  // reported as a misleading zero for each component.
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
   total: number;
 }
 
@@ -88,6 +99,8 @@ export interface WorkflowAgentRunMetadata {
   activity?: WorkflowAgentActivity;
   promptPreview?: string;
   outputPreview?: string;
+  /** Structured error attached by the runtime when a subagent run fails. */
+  error?: { name: string; message: string; stack?: string };
 }
 
 export type WorkflowApprovalMode = "interactive" | "auto";

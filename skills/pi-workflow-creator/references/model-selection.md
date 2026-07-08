@@ -3,6 +3,15 @@
 Use exact enabled provider/id references whenever possible. Avoid short aliases
 unless the local Pi model registry explicitly documents them.
 
+> **Placeholder refs.** Every `opencode-go/*`, `anthropic/claude-opus-4-8`, and
+> `openai-codex/gpt-5.5` ref in this document, the templates, and the examples is
+> a **placeholder**. Replace each one with a model ref that is actually enabled
+> in the current Pi session's registry before running a workflow. An unknown or
+> disabled ref is not an error at parse time: the affected `agent()` branch
+> simply fails and returns `null` (with a structured error on its metadata), so a
+> workflow full of unknown refs will quietly produce all-`null` results. Confirm
+> the refs first.
+
 ## Defaults
 
 | Need | Recommended model | Thinking |

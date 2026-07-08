@@ -8,6 +8,7 @@ import type {
   WorkflowThinkingLevel,
   WorktreeIsolation,
 } from "./options.js";
+import { normalizeWorktreeIsolation } from "./worktree.js";
 
 export interface WorkflowMetaPhase {
   title: string;
@@ -22,6 +23,28 @@ export interface WorkflowMeta {
   phases?: WorkflowMetaPhase[];
 }
 
+export interface WorkflowSerializedError {
+  name: string;
+  message: string;
+  stack?: string;
+}
+
+type WorkflowAgentRunMetadataWithError = WorkflowAgentRunMetadata & { error?: WorkflowSerializedError };
+
+export interface WorkflowAgentRunRecord {
+  id: number;
+  label: string;
+  phase?: string;
+  prompt: string;
+  status: "running" | "done" | "error";
+  result?: unknown;
+  model?: WorkflowModelRef;
+  thinkingLevel?: WorkflowThinkingLevel;
+  isolation?: WorktreeIsolation;
+  metadata?: WorkflowAgentRunMetadataWithError;
+  error?: WorkflowSerializedError;
+}
+
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   agent?: Pick<WorkflowAgent, "run">;
@@ -31,6 +54,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   onAgentStart?: (event: {
+    id: number;
     label: string;
     phase?: string;
     prompt: string;
@@ -38,8 +62,19 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     thinkingLevel?: WorkflowThinkingLevel;
     isolation?: WorktreeIsolation;
   }) => void;
-  onAgentUpdate?: (event: { label: string; phase?: string; metadata: WorkflowAgentRunMetadata }) => void;
-  onAgentEnd?: (event: { label: string; phase?: string; result: unknown; metadata?: WorkflowAgentRunMetadata }) => void;
+  onAgentUpdate?: (event: {
+    id: number;
+    label: string;
+    phase?: string;
+    metadata: WorkflowAgentRunMetadataWithError;
+  }) => void;
+  onAgentEnd?: (event: {
+    id: number;
+    label: string;
+    phase?: string;
+    result: unknown;
+    metadata?: WorkflowAgentRunMetadataWithError;
+  }) => void;
 }
 
 export interface WorkflowRunResult<T = unknown> {
@@ -49,6 +84,7 @@ export interface WorkflowRunResult<T = unknown> {
   phases: string[];
   agentCount: number;
   durationMs: number;
+  agents: WorkflowAgentRunRecord[];
 }
 
 export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema | undefined> {
@@ -67,6 +103,7 @@ interface RuntimeState {
   phases: string[];
   agentCount: number;
   spent: number;
+  agents: WorkflowAgentRunRecord[];
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -81,7 +118,7 @@ export async function runWorkflow<T = unknown>(
 ): Promise<WorkflowRunResult<T>> {
   const started = Date.now();
   const { meta, body } = parseWorkflowScript(script);
-  const state: RuntimeState = { logs: [], phases: [], agentCount: 0, spent: 0 };
+  const state: RuntimeState = { logs: [], phases: [], agentCount: 0, spent: 0, agents: [] };
   const agentRunner = options.agent ?? new WorkflowAgent(options);
   const concurrency = Math.max(
     1,
@@ -110,7 +147,7 @@ export async function runWorkflow<T = unknown>(
   });
 
   const throwIfAborted = () => {
-    if (options.signal?.aborted) throw new Error("workflow aborted");
+    if (options.signal?.aborted) throw createAbortError("workflow aborted");
   };
 
   const agent = async (prompt: unknown, agentOptions: unknown = {}) => {
@@ -121,9 +158,30 @@ export async function runWorkflow<T = unknown>(
     const assignedPhase = normalizedOptions.phase ?? state.currentPhase;
     const requestedLabel = normalizedOptions.label?.trim();
     const run = limiter(async () => {
-      state.agentCount++;
-      const label = requestedLabel || defaultAgentLabel(assignedPhase, state.agentCount);
+      const id = ++state.agentCount;
+      const label = requestedLabel || defaultAgentLabel(assignedPhase, id);
+      const record: WorkflowAgentRunRecord = {
+        id,
+        label,
+        phase: assignedPhase,
+        prompt: taskPrompt,
+        status: "running",
+        model: normalizedOptions.model,
+        thinkingLevel: normalizedOptions.thinkingLevel,
+        isolation: normalizedOptions.isolation,
+      };
+      state.agents.push(record);
+      let metadata: WorkflowAgentRunMetadataWithError | undefined;
+      let lastUsageTotal = 0;
+      const recordUsageDelta = (value: WorkflowAgentRunMetadata | undefined) => {
+        const total = value?.usage?.total;
+        if (typeof total !== "number" || !Number.isFinite(total) || total <= lastUsageTotal) return;
+        state.spent += total - lastUsageTotal;
+        lastUsageTotal = total;
+      };
+
       options.onAgentStart?.({
+        id,
         label,
         phase: assignedPhase,
         prompt: taskPrompt,
@@ -131,7 +189,6 @@ export async function runWorkflow<T = unknown>(
         thinkingLevel: normalizedOptions.thinkingLevel,
         isolation: normalizedOptions.isolation,
       });
-      let metadata: WorkflowAgentRunMetadata | undefined;
       try {
         throwIfAborted();
         const result = await agentRunner.run(taskPrompt, {
@@ -144,20 +201,34 @@ export async function runWorkflow<T = unknown>(
           isolation: normalizedOptions.isolation,
           onMetadata(value: WorkflowAgentRunMetadata) {
             metadata = value;
+            record.metadata = metadata;
+            recordUsageDelta(value);
           },
           onUpdate(value: WorkflowAgentRunMetadata) {
             metadata = value;
-            options.onAgentUpdate?.({ label, phase: assignedPhase, metadata: value });
+            record.metadata = metadata;
+            recordUsageDelta(value);
+            options.onAgentUpdate?.({ id, label, phase: assignedPhase, metadata });
           },
         } as any);
         throwIfAborted();
-        state.spent += estimateTokens(result);
-        options.onAgentEnd?.({ label, phase: assignedPhase, result, metadata });
+        recordUsageDelta(metadata);
+        record.status = "done";
+        record.result = result;
+        record.metadata = metadata;
+        options.onAgentEnd?.({ id, label, phase: assignedPhase, result, metadata });
         return result;
       } catch (error) {
-        if (options.signal?.aborted) throw error;
-        log(`agent ${label} failed: ${error instanceof Error ? error.message : String(error)}`);
-        options.onAgentEnd?.({ label, phase: assignedPhase, result: null, metadata });
+        if (isAbortError(error)) throw error;
+        const errorInfo = serializeError(error);
+        metadata = attachAgentError(metadata, errorInfo, options.cwd);
+        recordUsageDelta(metadata);
+        record.status = "error";
+        record.result = null;
+        record.metadata = metadata;
+        record.error = errorInfo;
+        log(`agent ${label} failed: ${errorInfo.message}`);
+        options.onAgentEnd?.({ id, label, phase: assignedPhase, result: null, metadata });
         return null;
       }
     });
@@ -180,7 +251,7 @@ export async function runWorkflow<T = unknown>(
         try {
           return await thunk();
         } catch (error) {
-          if (options.signal?.aborted) throw error;
+          if (isAbortError(error)) throw error;
           log(`parallel[${index}] failed: ${error instanceof Error ? error.message : String(error)}`);
           return null;
         }
@@ -206,7 +277,7 @@ export async function runWorkflow<T = unknown>(
             value = await stage(value, item, index);
             throwIfAborted();
           } catch (error) {
-            if (options.signal?.aborted) throw error;
+            if (isAbortError(error)) throw error;
             log(`pipeline[${index}] failed: ${error instanceof Error ? error.message : String(error)}`);
             return null;
           }
@@ -252,8 +323,11 @@ ${body}
 `,
   );
   const result = await fn(context);
-  await Promise.allSettled([...pendingAgentRuns]);
-  assertStructuredCloneable(result, "workflow result");
+  if (pendingAgentRuns.size > 0) {
+    log(`[warn] awaited ${pendingAgentRuns.size} unawaited agent() call(s) after workflow script returned`);
+    await Promise.allSettled([...pendingAgentRuns]);
+  }
+  assertJsonSerializable(result, "workflow result");
   return {
     meta,
     result: result as T,
@@ -261,6 +335,7 @@ ${body}
     phases: state.phases,
     agentCount: state.agentCount,
     durationMs: Date.now() - started,
+    agents: state.agents,
   };
 }
 
@@ -294,6 +369,12 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
 
   const meta = evaluateLiteral(declarator.init, "meta");
   validateMeta(meta);
+
+  for (const node of (ast.body as AnyNode[]).slice(1)) {
+    if (isModuleOnlySyntax(node)) {
+      throw new Error("workflow scripts do not support import/export statements after the meta export");
+    }
+  }
 
   return {
     meta,
@@ -364,20 +445,31 @@ function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
   }
 }
 
+function isModuleOnlySyntax(node: AnyNode): boolean {
+  return node.type === "ImportDeclaration" || node.type.startsWith("Export");
+}
+
 function createLimiter(limit: number) {
   let active = 0;
   const queue: Array<() => void> = [];
-  const next = () => {
-    active--;
-    queue.shift()?.();
+  const drain = () => {
+    if (active >= limit) return;
+    const start = queue.shift();
+    if (!start) return;
+    active++;
+    start();
   };
   return async <T>(fn: () => Promise<T>): Promise<T> => {
-    if (active >= limit) await new Promise<void>((resolve) => queue.push(resolve));
-    active++;
+    if (active < limit) {
+      active++;
+    } else {
+      await new Promise<void>((resolve) => queue.push(resolve));
+    }
     try {
       return await fn();
     } finally {
-      next();
+      active--;
+      drain();
     }
   };
 }
@@ -428,6 +520,7 @@ function optionalIsolation(value: unknown): WorktreeIsolation | undefined {
   }
   const isolation = value as Record<string, unknown>;
   if (isolation.mode !== "worktree") throw new TypeError("agent isolation mode must be 'worktree'");
+  // Per-field type/shape checks for untrusted script input (friendly per-field errors).
   const normalized: Exclude<WorktreeIsolation, "none" | "worktree"> = { mode: "worktree" };
   const baseRef = optionalString(isolation.baseRef, "agent isolation baseRef");
   const rootDir = optionalString(isolation.rootDir, "agent isolation rootDir");
@@ -441,6 +534,11 @@ function optionalIsolation(value: unknown): WorktreeIsolation | undefined {
   if (keep !== undefined) normalized.keep = keep;
   if (dirty !== undefined) normalized.dirty = dirty;
   if (merge !== undefined) normalized.merge = merge;
+  // Delegate cross-field value semantics (e.g. dirty:'patch' requires baseRef:'HEAD')
+  // to normalizeWorktreeIsolation, the single source of truth in worktree.ts, so the
+  // runtime and the worktree manager can never disagree on what a valid isolation is.
+  // The sparse object (not the fully-defaulted result) is returned to preserve round-trips.
+  normalizeWorktreeIsolation(normalized);
   return normalized;
 }
 
@@ -475,14 +573,23 @@ function normalizeAgentOptions(value: unknown): AgentOptions {
   };
 }
 
-function assertStructuredCloneable(value: unknown, name: string): void {
+function assertJsonSerializable(value: unknown, name: string): void {
   try {
     structuredClone(value);
   } catch (error) {
     const detail = error instanceof Error ? ` ${error.message}` : "";
     throw new Error(
-      `${name} must be structured-cloneable; did you forget to await agent(), parallel(), or pipeline()?${detail}`,
+      `${name} must be JSON-serializable; did you forget to await agent(), parallel(), or pipeline()?${detail}`,
     );
+  }
+
+  try {
+    if (JSON.stringify(value) === undefined) {
+      throw new TypeError("JSON.stringify returned undefined");
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? ` ${error.message}` : "";
+    throw new Error(`${name} must be JSON-serializable; JSON.stringify failed.${detail}`);
   }
 }
 
@@ -497,6 +604,36 @@ function buildAgentInstructions(phase: string | undefined, options: AgentOptions
   return lines.length ? lines.join("\n") : undefined;
 }
 
-function estimateTokens(value: unknown): number {
-  return Math.ceil(JSON.stringify(value ?? "").length / 4);
+function serializeError(error: unknown): WorkflowSerializedError {
+  if (error instanceof Error) {
+    return {
+      name: error.name || "Error",
+      message: error.message,
+      ...(error.stack ? { stack: error.stack } : {}),
+    };
+  }
+  return { name: "Error", message: String(error) };
+}
+
+function attachAgentError(
+  metadata: WorkflowAgentRunMetadataWithError | undefined,
+  error: WorkflowSerializedError,
+  cwd: string | undefined,
+): WorkflowAgentRunMetadataWithError {
+  return {
+    cwd: cwd ?? process.cwd(),
+    ...metadata,
+    error,
+    activity: metadata?.activity ?? { kind: "error", text: error.message, updatedAt: Date.now() },
+  };
+}
+
+function createAbortError(message: string): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown): boolean {
+  return !!error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError";
 }

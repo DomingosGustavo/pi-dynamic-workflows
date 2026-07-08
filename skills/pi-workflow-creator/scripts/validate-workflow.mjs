@@ -1,8 +1,17 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
-import { parse } from "acorn";
 
 const MAX_REVIEWABLE_BYTES = 524_288;
+
+let parse;
+try {
+  ({ parse } = await import("acorn"));
+} catch (error) {
+  console.error("cannot load the 'acorn' parser required by this validator.");
+  console.error("install it first, e.g. `npm install` in the pi-dynamic-workflows package.");
+  console.error(`details: ${messageOf(error)}`);
+  process.exit(1);
+}
 
 const file = process.argv[2];
 if (!file) {
@@ -121,8 +130,19 @@ function validateMetaExport(node) {
   if (typeof meta.description !== "string" || !meta.description.trim()) {
     errors.push("meta.description must be a non-empty string");
   }
-  if (meta.phases !== undefined && !Array.isArray(meta.phases)) {
-    errors.push("meta.phases must be an array when present");
+  if (meta.whenToUse !== undefined && typeof meta.whenToUse !== "string") {
+    errors.push("meta.whenToUse must be a string when present");
+  }
+  if (meta.phases !== undefined) {
+    if (!Array.isArray(meta.phases)) {
+      errors.push("meta.phases must be an array when present");
+    } else {
+      for (const [index, phase] of meta.phases.entries()) {
+        if (!phase || typeof phase !== "object" || typeof phase.title !== "string") {
+          errors.push(`meta.phases[${index}] must have a title string`);
+        }
+      }
+    }
   }
 }
 
@@ -189,13 +209,50 @@ function literalKey(node) {
 
 function validateParallelCall(node) {
   const firstArg = node.arguments[0];
-  if (firstArg?.type !== "ArrayExpression") return;
-  for (const element of firstArg.elements) {
-    if (!element) continue;
-    if (element.type === "CallExpression" && callName(element.callee) === "agent") {
-      warnings.push(`parallel() at line ${line(node)} appears to contain bare agent() calls; pass thunks`);
+  if (!firstArg) return;
+
+  // parallel([ agent(...), agent(...) ]) — literal array of bare agent() calls.
+  if (firstArg.type === "ArrayExpression") {
+    for (const element of firstArg.elements) {
+      if (!element) continue;
+      if (element.type === "CallExpression" && callName(element.callee) === "agent") {
+        warnings.push(`parallel() at line ${line(node)} appears to contain bare agent() calls; pass thunks`);
+      }
+    }
+    return;
+  }
+
+  // parallel(items.map(item => agent(...))) — the classic antipattern. The .map()
+  // callback must RETURN a thunk (() => agent(...)), not a started agent() promise.
+  if (firstArg.type === "CallExpression" && memberName(firstArg.callee)?.endsWith(".map")) {
+    const callback = firstArg.arguments[0];
+    if (callbackReturnsBareAgent(callback)) {
+      warnings.push(
+        `parallel() at line ${line(node)} maps to bare agent() calls; return a thunk instead: items.map(item => () => agent(...))`,
+      );
     }
   }
+}
+
+function callbackReturnsBareAgent(node) {
+  if (!node || (node.type !== "ArrowFunctionExpression" && node.type !== "FunctionExpression")) {
+    return false;
+  }
+  const returned = returnedExpression(node);
+  return returned?.type === "CallExpression" && callName(returned.callee) === "agent";
+}
+
+function returnedExpression(fn) {
+  // Arrow with an expression body: item => <expr>
+  if (fn.type === "ArrowFunctionExpression" && fn.body?.type !== "BlockStatement") {
+    return fn.body;
+  }
+  // Block body: find a single top-level `return <expr>`.
+  const body = fn.body?.type === "BlockStatement" ? (fn.body.body ?? []) : [];
+  for (const statement of body) {
+    if (statement.type === "ReturnStatement") return statement.argument ?? null;
+  }
+  return null;
 }
 
 function walk(node, visitors) {

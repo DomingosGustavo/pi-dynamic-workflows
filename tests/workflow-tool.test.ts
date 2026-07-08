@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { recomputeWorkflowSnapshot } from "../src/display.js";
-import { createWorkflowTool, prepareWorkflowReview, slugWorkflowName } from "../src/workflow-tool.js";
+import {
+  createWorkflowTool,
+  prepareWorkflowReview,
+  runWorkflowScriptWithDisplay,
+  slugWorkflowName,
+} from "../src/workflow-tool.js";
 
 test("createWorkflowTool describes phases as optional and dynamic", () => {
   const tool = createWorkflowTool();
@@ -39,6 +44,7 @@ test("workflow tool result renderer does not echo the workflow progress panel in
     runningCount: 0,
     doneCount: 1,
     errorCount: 0,
+    skippedCount: 0,
     agents: [
       {
         id: 1,
@@ -102,7 +108,12 @@ test("prepareWorkflowReview writes normalized script under the review directory"
     assert.equal(review.status, "pending");
     assert.equal(review.approved, false);
     assert.equal(review.approvalMode, "interactive");
-    assert.equal(review.script, "export const meta = { name: 'Security Review!', description: 'Review' }\nreturn {}\n");
+    assert.match(review.script, /^\/\/ Pi workflow review artifact\./);
+    assert.match(review.script, /full host privileges, not inside a sandbox/);
+    assert.match(
+      review.script,
+      /export const meta = \{ name: 'Security Review!', description: 'Review' \}\nreturn \{\}\n$/,
+    );
     assert.equal(await readFile(review.path, "utf8"), review.script);
   } finally {
     await rm(cwd, { recursive: true, force: true });
@@ -160,6 +171,209 @@ test("createWorkflowTool interactive mode fails clearly without UI", async () =>
         } as any),
       /workflow approval requires an interactive UI/,
     );
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runWorkflowScriptWithDisplay completes a happy path with a fake agent runner", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-display-happy-"));
+  const updates: Array<{ content: Array<{ type: "text"; text: string }>; details: any }> = [];
+  const meta = { name: "display_happy", description: "Run with fake agent" };
+  const script = `export const meta = { name: 'display_happy', description: 'Run with fake agent' }
+phase('Scan')
+const scan = await agent('scan repo', { label: 'scan repo' })
+return { scan }
+`;
+  const agent = {
+    async run(prompt: string, options: any): Promise<{ answer: string }> {
+      const metadata = {
+        cwd,
+        usage: {
+          input: 2,
+          output: 1,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 3,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        activity: { kind: "done", text: "done", updatedAt: 1 },
+      };
+      options.onUpdate?.(metadata);
+      options.onMetadata?.(metadata);
+      return { answer: prompt };
+    },
+  };
+
+  try {
+    const { result, snapshot } = await runWorkflowScriptWithDisplay(script, meta, {
+      cwd,
+      agent,
+      onUpdate: (update) => updates.push(update),
+      ctx: { hasUI: false },
+    });
+
+    assert.deepEqual(result.result, { scan: { answer: "scan repo" } });
+    assert.equal(snapshot.agentCount, 1);
+    assert.equal(snapshot.doneCount, 1);
+    assert.equal(snapshot.usage?.total, 3);
+    assert.ok(updates.some((update) => update.content[0]?.text.includes("Workflow completed")));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runWorkflowScriptWithDisplay marks running agents skipped when aborted", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-display-abort-"));
+  const controller = new AbortController();
+  const updates: Array<{ content: Array<{ type: "text"; text: string }>; details: any }> = [];
+  let rejectRun: (reason?: unknown) => void = () => {};
+  const blocker = new Promise<never>((_resolve, reject) => {
+    rejectRun = reject;
+  });
+  let started = 0;
+  const agent = {
+    async run(): Promise<never> {
+      started++;
+      if (started === 2) {
+        const error = new Error("stop all work");
+        error.name = "AbortError";
+        controller.abort();
+        rejectRun(error);
+      }
+      return blocker;
+    },
+  };
+  const meta = { name: "abort_display", description: "Abort display" };
+  const script = `export const meta = { name: 'abort_display', description: 'Abort display' }
+const first = agent('first', { label: 'first' })
+const second = agent('second', { label: 'second' })
+return await Promise.all([first, second])
+`;
+
+  try {
+    await assert.rejects(
+      () =>
+        runWorkflowScriptWithDisplay(script, meta, {
+          cwd,
+          agent,
+          signal: controller.signal,
+          concurrency: 2,
+          onUpdate: (update) => updates.push(update),
+          ctx: { hasUI: false },
+        }),
+      (error: any) => error?.name === "AbortError" && /Workflow was aborted/.test(error.message),
+    );
+
+    const finalDetails = updates.at(-1)?.details;
+    assert.equal(finalDetails.skippedCount, 2);
+    assert.deepEqual(
+      finalDetails.agents.map((agentSnapshot: any) => agentSnapshot.status),
+      ["skipped", "skipped"],
+    );
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runWorkflowScriptWithDisplay rejects scripts that never call agent", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-zero-agent-"));
+  const meta = { name: "zero_agent", description: "No agents" };
+  const script = "export const meta = { name: 'zero_agent', description: 'No agents' }\nreturn { ok: true }";
+
+  try {
+    await assert.rejects(
+      () => runWorkflowScriptWithDisplay(script, meta, { cwd, ctx: { hasUI: false } }),
+      /workflow scripts must call agent\(\) at least once/,
+    );
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("createWorkflowTool auto-approval records auto review metadata before running", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-auto-"));
+  const updates: Array<{ content: Array<{ type: "text"; text: string }>; details: any }> = [];
+  const tool = createWorkflowTool({ cwd, approvalMode: "auto" });
+  const script = "export const meta = { name: 'auto_mode', description: 'Auto mode' }\nreturn { ok: true }";
+
+  try {
+    await assert.rejects(
+      () =>
+        tool.execute("call-1", { script }, undefined, (update) => updates.push(update), {
+          cwd,
+          hasUI: false,
+        } as any),
+      /workflow scripts must call agent\(\) at least once/,
+    );
+
+    assert.ok(updates[0]?.content[0]?.text.includes("approvalMode is auto"));
+    assert.equal(updates[0]?.details.review.approvalMode, "auto");
+    assert.match(updates[0]?.details.review.path, /auto_mode\.workflow\.js$/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runWorkflowScriptWithDisplay enforces token budget using real usage metadata", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-budget-"));
+  let calls = 0;
+  const agent = {
+    async run(prompt: string, options: any): Promise<string> {
+      calls++;
+      options.onMetadata?.({
+        cwd,
+        usage: {
+          input: 6,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 6,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+      });
+      return prompt;
+    },
+  };
+  const meta = { name: "budget_demo", description: "Budget demo" };
+  const script = `export const meta = { name: 'budget_demo', description: 'Budget demo' }
+const first = await agent('first', { label: 'first' })
+const second = await agent('second', { label: 'second' })
+return { first, second }
+`;
+
+  try {
+    await assert.rejects(
+      () =>
+        runWorkflowScriptWithDisplay(script, meta, {
+          cwd,
+          agent,
+          tokenBudget: 5,
+          ctx: { hasUI: false },
+        }),
+      /workflow token budget exhausted/,
+    );
+    assert.equal(calls, 1);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("prepareWorkflowReview writes collision-safe artifact filenames", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-collision-"));
+  const now = new Date("2026-06-22T23:59:58.123Z");
+  const meta = { name: "collision_demo", description: "Collision demo" };
+  const script = "export const meta = { name: 'collision_demo', description: 'Collision demo' }\nreturn {}\n";
+
+  try {
+    const first = await prepareWorkflowReview(script, meta, cwd, { approvalMode: "interactive", now });
+    const second = await prepareWorkflowReview(script, meta, cwd, { approvalMode: "interactive", now });
+
+    assert.notEqual(first.path, second.path);
+    assert.match(first.path, /20260622T235958Z-collision_demo\.workflow\.js$/);
+    assert.match(second.path, /20260622T235958123Z-collision_demo-[a-f0-9]{8}\.workflow\.js$/);
+    assert.equal(await readFile(first.path, "utf8"), first.script);
+    assert.equal(await readFile(second.path, "utf8"), second.script);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

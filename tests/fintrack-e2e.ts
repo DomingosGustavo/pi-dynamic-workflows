@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,7 +23,12 @@ import {
 } from "../src/index.js";
 
 const execFileAsync = promisify(execFile);
-const FINTRACK_CWD = "/home/gustavo/fintrack";
+// Opt-in, portable e2e target. Point PI_E2E_REPO (preferred) or FINTRACK_CWD at
+// an existing repository to run the FinTrack audit workflow; otherwise the test
+// self-skips with a clean pass so CI and other machines are not tied to a
+// hardcoded local path.
+const E2E_REPO = process.env.PI_E2E_REPO ?? process.env.FINTRACK_CWD ?? "";
+const FINTRACK_CWD = E2E_REPO;
 const PREFERRED_WORKHORSE_REFS = [
   "opencode-go/kimi-k2.7-code",
   "opencode-go/deepseek-v4-flash",
@@ -55,7 +61,12 @@ interface RecordedWorkflowCall {
   };
 }
 
-test("parent Pi model generates and runs a FinTrack audit workflow", { timeout: 1000 * 60 * 20 }, async () => {
+test("parent Pi model generates and runs a FinTrack audit workflow", { timeout: 1000 * 60 * 20 }, async (t) => {
+  if (!FINTRACK_CWD || !existsSync(FINTRACK_CWD)) {
+    t.skip("set PI_E2E_REPO (or FINTRACK_CWD) to an existing repository path to run the FinTrack audit e2e");
+    return;
+  }
+
   const beforeStatus = await gitStatus(FINTRACK_CWD);
   const reviewDir = await mkdtemp(join(tmpdir(), "fintrack-workflow-reviews-"));
   const agentDir = getAgentDir();
@@ -138,9 +149,9 @@ test("parent Pi model generates and runs a FinTrack audit workflow", { timeout: 
         "Generate a compact bounded workflow that finishes quickly: exactly four parallel project-inspection subagents total, with no additional synthesis or judge subagent.",
         "The workflow script should synthesize by returning a plain JSON-serializable object containing the four concise reports plus prioritized security and improvement fields derived from those reports.",
         `Use currently supported open-weight workhorse model refs where useful, including these runnable refs from this Pi registry: ${workhorseRefs.join(", ")}.`,
-        "Keep every subagent tiny: inspect only /home/gustavo/fintrack, read at most 4 files per inspection agent, and make each agent return at most 8 bullets.",
+        `Keep every subagent tiny: inspect only ${E2E_REPO}, read at most 4 files per inspection agent, and make each agent return at most 8 bullets.`,
         "Do not run broad filesystem scans such as `find /`, do not run package-manager commands, do not run tests/builds, do not install dependencies, and do not access network resources.",
-        "Prefer project-local commands only: `pwd`, `git status --short`, `rg --files /home/gustavo/fintrack | head`, `rg -n ... /home/gustavo/fintrack/src | head`, and targeted `sed -n`/`cat` for files under /home/gustavo/fintrack.",
+        `Prefer project-local commands only: \`pwd\`, \`git status --short\`, \`rg --files ${E2E_REPO} | head\`, \`rg -n ... ${E2E_REPO}/src | head\`, and targeted \`sed -n\`/\`cat\` for files under ${E2E_REPO}.`,
         "Every agent() call must include isolation: { mode: 'worktree', dirty: 'ignore', merge: 'none' } so the parent FinTrack working tree remains unchanged.",
         "No agent should write files; the workflow must return the final audit data as its result only.",
         "This test harness auto-approves workflow execution, but the tool must still record review path/script metadata.",

@@ -43,6 +43,7 @@ The Pi tool accepts an object with:
 | --- | --- | --- |
 | `script` | string | Required raw JavaScript. Do not wrap in Markdown fences. |
 | `args` | any | Optional value exposed as global `args` in the script. |
+| `tokenBudget` | number or null | Optional total token budget exposed as `budget.total`; `null` (or omitted) means unlimited. |
 
 Interactive sessions write the script to a review file before execution:
 
@@ -154,11 +155,20 @@ const result = await agent("Inspect src/auth for security issues.", {
 | `model` | string or `{ provider, id }` | Prefer exact provider/id refs. See `model-selection.md`. |
 | `thinkingLevel` | string | One of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. |
 | `isolation` | string or object | Use worktree isolation for project inspection or parallel mutation. |
-| `agentType` | string | Request a registered subagent role/type when available. |
+| `agentType` | string | Free-text role hint. It does not select a registered agent implementation; it only appends `Act as workflow subagent type: <agentType>` to the subagent instructions. |
 
 Without `schema`, `agent()` returns the subagent final text as a string. With
 `schema`, it returns the validated object directly. If an agent fails, the
-runtime logs the failure and returns `null` for that branch.
+runtime logs the failure and returns `null` for that branch — but it also
+attaches a structured error record (`{ name, message, stack? }`) to that agent's
+run metadata (`metadata.error`), so the failure is inspectable in the workflow
+review/progress artifacts even though the branch value is `null`. Always read
+hand-offs null-safely (`result?.field ?? fallback`).
+
+Aborting a running workflow (for example pressing `Esc`) rejects in-flight
+agents with an `AbortError` (an `Error` whose `name` is `"AbortError"`). Abort
+rejections propagate rather than being swallowed into `null`, so the whole
+workflow stops and active subagents are surfaced as skipped.
 
 ## 6. `parallel()` And `pipeline()`
 
@@ -256,7 +266,13 @@ const input =
 Use `cwd` or `process.cwd()` only to tell subagents where they are operating.
 The parent workflow should not attempt direct filesystem work.
 
-`budget.total` is `null` when no token target is set. Guard budget-scaled loops:
+`budget.total` is the token target passed through the workflow tool's
+`tokenBudget` input (non-null when the caller provides one) and `null` when no
+target is set. `budget.spent()` accumulates real subagent token usage as agents
+report it, and `budget.remaining()` returns `Infinity` when `total` is `null`.
+When a budget is set and it is exhausted, the next `agent()` call throws
+`workflow token budget exhausted`, so always pair a budget with an explicit
+hard stop. Guard budget-scaled loops:
 
 ```js
 while (budget.total && budget.remaining() > 50_000 && found.length < 100) {

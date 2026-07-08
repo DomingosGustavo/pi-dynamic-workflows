@@ -4,6 +4,14 @@ import type { Static, TSchema } from "typebox";
 export interface StructuredOutputCapture<T = unknown> {
   value: T | undefined;
   called: boolean;
+  /** Soft warnings recorded while capturing (e.g. repeated structured_output calls). */
+  warnings?: string[];
+  /** Number of times execute() was invoked, including ignored duplicates. */
+  callCount?: number;
+  /** Number of structured_output tool calls the model attempted, including schema-invalid ones. */
+  attempts?: number;
+  /** Message from the most recent schema-invalid (rejected) structured_output attempt. */
+  lastError?: string;
 }
 
 export interface StructuredOutputToolOptions<TSchemaDef extends TSchema> {
@@ -35,6 +43,23 @@ export function createStructuredOutputTool<TSchemaDef extends TSchema>({
     ],
     parameters: schema,
     async execute(_toolCallId, params) {
+      capture.callCount = (capture.callCount ?? 0) + 1;
+      if (capture.called) {
+        // First result is authoritative; ignore later calls but record a soft warning.
+        const warning = `${name} called ${capture.callCount} times; keeping the first result and ignoring later call(s).`;
+        capture.warnings ??= [];
+        capture.warnings.push(warning);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Structured output already received; ignoring this repeated ${name} call.`,
+            },
+          ],
+          details: capture.value,
+          terminate: true,
+        };
+      }
       capture.value = params;
       capture.called = true;
       return {
