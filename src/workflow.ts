@@ -1,13 +1,16 @@
+import { createHash } from "node:crypto";
 import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
 import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
+import { DEFAULT_WORKFLOW_MODEL_CATALOG, workflowJobTypes } from "./model-selection.js";
 import type {
   WorkflowAgentRunMetadata,
   WorkflowModelRef,
   WorkflowThinkingLevel,
   WorktreeIsolation,
 } from "./options.js";
+import type { WorkflowCompletedCheckpoint } from "./workflow-state.js";
 import { normalizeWorktreeIsolation } from "./worktree.js";
 
 export interface WorkflowMetaPhase {
@@ -27,6 +30,21 @@ export interface WorkflowSerializedError {
   name: string;
   message: string;
   stack?: string;
+}
+
+export interface WorkflowPauseInfo {
+  reason: string;
+  data?: unknown;
+  /** Deterministic key for explicit pauses. */
+  key?: string;
+}
+
+export interface WorkflowResumeState {
+  workflowId: string;
+  tokensSpent: number;
+  completed: Record<string, WorkflowCompletedCheckpoint>;
+  /** Keys of explicit pauses that have already been acknowledged and should be skipped on replay. */
+  acknowledgedPauseKeys?: string[];
 }
 
 type WorkflowAgentRunMetadataWithError = WorkflowAgentRunMetadata & { error?: WorkflowSerializedError };
@@ -49,7 +67,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   agent?: Pick<WorkflowAgent, "run">;
   concurrency?: number;
-  tokenBudget?: number | null;
+  resume?: WorkflowResumeState;
+  onAgentCheckpoint?: (checkpoint: WorkflowCompletedCheckpoint, tokensSpent: number) => void | Promise<void>;
   signal?: AbortSignal;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
@@ -85,6 +104,8 @@ export interface WorkflowRunResult<T = unknown> {
   agentCount: number;
   durationMs: number;
   agents: WorkflowAgentRunRecord[];
+  tokensSpent: number;
+  paused?: WorkflowPauseInfo;
 }
 
 export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema | undefined> {
@@ -92,6 +113,8 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   phase?: string;
   schema?: TSchemaDef;
   model?: WorkflowModelRef;
+  /** Select from the configured catalog when model is omitted. */
+  job?: string;
   thinkingLevel?: WorkflowThinkingLevel;
   isolation?: WorktreeIsolation;
   agentType?: string;
@@ -118,7 +141,13 @@ export async function runWorkflow<T = unknown>(
 ): Promise<WorkflowRunResult<T>> {
   const started = Date.now();
   const { meta, body } = parseWorkflowScript(script);
-  const state: RuntimeState = { logs: [], phases: [], agentCount: 0, spent: 0, agents: [] };
+  const state: RuntimeState = {
+    logs: [],
+    phases: [],
+    agentCount: 0,
+    spent: options.resume?.tokensSpent ?? 0,
+    agents: [],
+  };
   const agentRunner = options.agent ?? new WorkflowAgent(options);
   const concurrency = Math.max(
     1,
@@ -126,6 +155,7 @@ export async function runWorkflow<T = unknown>(
   );
   const limiter = createLimiter(concurrency);
   const pendingAgentRuns = new Set<Promise<unknown>>();
+  const pendingRejections: unknown[] = [];
 
   const log = (message: string) => {
     const text = String(message);
@@ -140,26 +170,104 @@ export async function runWorkflow<T = unknown>(
     options.onPhase?.(text);
   };
 
-  const budget = Object.freeze({
-    total: options.tokenBudget ?? null,
-    spent: () => state.spent,
-    remaining: () => (options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - state.spent)),
-  });
-
   const throwIfAborted = () => {
     if (options.signal?.aborted) throw createAbortError("workflow aborted");
   };
 
-  const agent = async (prompt: unknown, agentOptions: unknown = {}) => {
+  const pauseOccurrences = new Map<string, number>();
+  const pause = (reason: unknown = "Workflow paused", data?: unknown): never => {
+    const text = requireString(reason, "pause reason");
+    if (data !== undefined) assertJsonSerializable(data, "pause data");
+    const payload = stableJsonStringify({ reason: text, data });
+    const payloadHash = createHash("sha256").update(payload).digest("hex").slice(0, 16);
+    const occurrence = (pauseOccurrences.get(payloadHash) ?? 0) + 1;
+    pauseOccurrences.set(payloadHash, occurrence);
+    const key = computePauseKey(payloadHash, occurrence);
+    if (options.resume?.acknowledgedPauseKeys?.includes(key)) {
+      log(`[resume] skipped acknowledged pause: ${text}`);
+      return undefined as never;
+    }
+    throw new WorkflowPauseSignal(text, data, key);
+  };
+
+  const seenLabels = new Map<string, true>();
+  const completedByLabel = new Map<string, WorkflowCompletedCheckpoint>();
+  if (options.resume?.completed) {
+    for (const [label, checkpoint] of Object.entries(options.resume.completed)) {
+      completedByLabel.set(label, checkpoint);
+    }
+  }
+  const agent = (prompt: unknown, agentOptions: unknown = {}): Promise<unknown> => {
     throwIfAborted();
-    if (budget.total !== null && budget.remaining() <= 0) throw new Error("workflow token budget exhausted");
     const taskPrompt = requireString(prompt, "agent prompt");
     const normalizedOptions = normalizeAgentOptions(agentOptions);
     const assignedPhase = normalizedOptions.phase ?? state.currentPhase;
     const requestedLabel = normalizedOptions.label?.trim();
+    const label = requestedLabel || defaultAgentLabel(assignedPhase, seenLabels.size + 1);
+    if (seenLabels.has(label)) {
+      throw new WorkflowLabelConflictError(`Duplicate workflow agent label "${label}"; labels must be unique`);
+    }
+    seenLabels.set(label, true);
+    const catalog = options.modelCatalog ?? DEFAULT_WORKFLOW_MODEL_CATALOG;
+    const knownJobs = workflowJobTypes(catalog);
+    if (!normalizedOptions.model && !normalizedOptions.job) {
+      throw new WorkflowConfigurationError(
+        `agent "${label}" must specify an explicit model or a job work type (one of: ${knownJobs.join(", ")})`,
+      );
+    }
+    // A bogus job string is a script bug even when an explicit model wins for
+    // execution: it still pollutes the checkpoint fingerprint, so reject it.
+    if (normalizedOptions.job && !Object.hasOwn(catalog.work, normalizedOptions.job)) {
+      throw new WorkflowConfigurationError(
+        `Unknown workflow job type "${normalizedOptions.job}". Known types: ${knownJobs.join(", ")}`,
+      );
+    }
+    const fingerprint = computeAgentFingerprint(taskPrompt, assignedPhase, label, normalizedOptions);
+
     const run = limiter(async () => {
+      const replay = completedByLabel.get(label);
+      if (replay) {
+        if (!replay.fingerprint) {
+          throw new WorkflowInfrastructureError(
+            `Cannot reuse completed agent "${label}": checkpoint is missing a fingerprint. ` +
+              "Legacy checkpoints are not supported; restart the workflow instead.",
+          );
+        }
+        if (replay.fingerprint !== fingerprint) {
+          throw new WorkflowInfrastructureError(
+            `Cannot reuse completed agent "${label}": fingerprint mismatch. ` +
+              "The replay-relevant invocation changed; restart the workflow instead.",
+          );
+        }
+        const id = ++state.agentCount;
+        const record: WorkflowAgentRunRecord = {
+          id,
+          label,
+          phase: assignedPhase,
+          prompt: taskPrompt,
+          status: "done",
+          result: replay.result,
+          model: normalizedOptions.model,
+          thinkingLevel: normalizedOptions.thinkingLevel,
+          isolation: normalizedOptions.isolation,
+          metadata: replay.metadata,
+        };
+        state.agents.push(record);
+        log(`reused completed agent ${label} from workflow ${options.resume?.workflowId}`);
+        options.onAgentStart?.({
+          id,
+          label,
+          phase: assignedPhase,
+          prompt: taskPrompt,
+          model: normalizedOptions.model,
+          thinkingLevel: normalizedOptions.thinkingLevel,
+          isolation: normalizedOptions.isolation,
+        });
+        options.onAgentEnd?.({ id, label, phase: assignedPhase, result: replay.result, metadata: replay.metadata });
+        return replay.result;
+      }
+
       const id = ++state.agentCount;
-      const label = requestedLabel || defaultAgentLabel(assignedPhase, id);
       const record: WorkflowAgentRunRecord = {
         id,
         label,
@@ -175,9 +283,10 @@ export async function runWorkflow<T = unknown>(
       let lastUsageTotal = 0;
       const recordUsageDelta = (value: WorkflowAgentRunMetadata | undefined) => {
         const total = value?.usage?.total;
-        if (typeof total !== "number" || !Number.isFinite(total) || total <= lastUsageTotal) return;
-        state.spent += total - lastUsageTotal;
-        lastUsageTotal = total;
+        const tokenDelta =
+          typeof total === "number" && Number.isFinite(total) && total > lastUsageTotal ? total - lastUsageTotal : 0;
+        state.spent += tokenDelta;
+        lastUsageTotal += tokenDelta;
       };
 
       options.onAgentStart?.({
@@ -189,6 +298,8 @@ export async function runWorkflow<T = unknown>(
         thinkingLevel: normalizedOptions.thinkingLevel,
         isolation: normalizedOptions.isolation,
       });
+      let agentResult: unknown;
+      let agentSucceeded = false;
       try {
         throwIfAborted();
         const result = await agentRunner.run(taskPrompt, {
@@ -197,6 +308,7 @@ export async function runWorkflow<T = unknown>(
           signal: options.signal,
           instructions: buildAgentInstructions(assignedPhase, normalizedOptions),
           model: normalizedOptions.model,
+          job: normalizedOptions.job,
           thinkingLevel: normalizedOptions.thinkingLevel,
           isolation: normalizedOptions.isolation,
           onMetadata(value: WorkflowAgentRunMetadata) {
@@ -213,11 +325,9 @@ export async function runWorkflow<T = unknown>(
         } as any);
         throwIfAborted();
         recordUsageDelta(metadata);
-        record.status = "done";
-        record.result = result;
-        record.metadata = metadata;
-        options.onAgentEnd?.({ id, label, phase: assignedPhase, result, metadata });
-        return result;
+        assertJsonSerializable(result, `result for agent "${label}"`);
+        agentResult = result;
+        agentSucceeded = true;
       } catch (error) {
         if (isAbortError(error)) throw error;
         const errorInfo = serializeError(error);
@@ -231,32 +341,64 @@ export async function runWorkflow<T = unknown>(
         options.onAgentEnd?.({ id, label, phase: assignedPhase, result: null, metadata });
         return null;
       }
+      if (agentSucceeded) {
+        record.status = "done";
+        record.result = agentResult;
+        record.metadata = metadata;
+        try {
+          await options.onAgentCheckpoint?.({ label, result: agentResult, metadata, fingerprint }, state.spent);
+        } catch (error) {
+          throw new WorkflowInfrastructureError(
+            `Failed to persist checkpoint for agent "${label}": ${error instanceof Error ? error.message : String(error)}`,
+            error,
+          );
+        }
+        options.onAgentEnd?.({ id, label, phase: assignedPhase, result: agentResult, metadata });
+        return agentResult;
+      }
+      return null;
     });
     pendingAgentRuns.add(run);
     run.then(
       () => pendingAgentRuns.delete(run),
-      () => pendingAgentRuns.delete(run),
+      (reason) => {
+        pendingAgentRuns.delete(run);
+        pendingRejections.push(reason);
+      },
     );
     return run;
   };
 
+  const PAUSED = Symbol("workflow paused");
   const parallel = async (thunks: Array<() => Promise<unknown>>) => {
     throwIfAborted();
     if (!Array.isArray(thunks)) throw new TypeError("parallel() expects an array of functions");
     if (thunks.some((thunk) => typeof thunk !== "function")) {
       throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)");
     }
-    return Promise.all(
+    const results = await Promise.all(
       thunks.map(async (thunk, index) => {
         try {
           return await thunk();
         } catch (error) {
+          if (
+            isWorkflowLabelConflictError(error) ||
+            isWorkflowInfrastructureError(error) ||
+            isWorkflowConfigurationError(error)
+          )
+            throw error;
           if (isAbortError(error)) throw error;
+          if (isWorkflowPauseSignal(error)) return { [PAUSED]: error };
           log(`parallel[${index}] failed: ${error instanceof Error ? error.message : String(error)}`);
           return null;
         }
       }),
     );
+    const paused = results.find(
+      (result): result is { [PAUSED]: unknown } => !!result && typeof result === "object" && PAUSED in result,
+    );
+    if (paused) throw paused[PAUSED];
+    return results;
   };
 
   const pipeline = async (
@@ -268,7 +410,7 @@ export async function runWorkflow<T = unknown>(
     if (stages.some((stage) => typeof stage !== "function")) {
       throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
     }
-    return Promise.all(
+    const results = await Promise.all(
       items.map(async (item, index) => {
         let value: unknown = item;
         for (const stage of stages) {
@@ -277,7 +419,14 @@ export async function runWorkflow<T = unknown>(
             value = await stage(value, item, index);
             throwIfAborted();
           } catch (error) {
+            if (
+              isWorkflowLabelConflictError(error) ||
+              isWorkflowInfrastructureError(error) ||
+              isWorkflowConfigurationError(error)
+            )
+              throw error;
             if (isAbortError(error)) throw error;
+            if (isWorkflowPauseSignal(error)) return { [PAUSED]: error };
             log(`pipeline[${index}] failed: ${error instanceof Error ? error.message : String(error)}`);
             return null;
           }
@@ -285,6 +434,11 @@ export async function runWorkflow<T = unknown>(
         return value;
       }),
     );
+    const paused = results.find(
+      (result): result is { [PAUSED]: unknown } => !!result && typeof result === "object" && PAUSED in result,
+    );
+    if (paused) throw paused[PAUSED];
+    return results;
   };
 
   const context = {
@@ -293,10 +447,10 @@ export async function runWorkflow<T = unknown>(
     pipeline,
     log,
     phase,
+    pause,
     args: options.args,
     cwd: options.cwd ?? process.cwd(),
     process: Object.freeze({ cwd: () => options.cwd ?? process.cwd() }),
-    budget,
     console: {
       log,
       info: log,
@@ -318,24 +472,50 @@ export async function runWorkflow<T = unknown>(
   const fn = new AsyncFunction(
     "ctx",
     `
-const { agent, parallel, pipeline, log, phase, args, cwd, process, budget, console, JSON, Math, Array, Object, String, Number, Boolean, Set, Map, Promise } = ctx;
+const { agent, parallel, pipeline, log, phase, pause, args, cwd, process, console, JSON, Math, Array, Object, String, Number, Boolean, Set, Map, Promise } = ctx;
 ${body}
 `,
   );
-  const result = await fn(context);
+  let result: unknown;
+  let paused: WorkflowPauseInfo | undefined;
+  try {
+    result = await fn(context);
+  } catch (error) {
+    if (!isWorkflowPauseSignal(error)) throw error;
+    paused = { reason: error.message, data: error.data, key: error.key };
+    log(`[paused] ${error.message}`);
+  }
   if (pendingAgentRuns.size > 0) {
     log(`[warn] awaited ${pendingAgentRuns.size} unawaited agent() call(s) after workflow script returned`);
     await Promise.allSettled([...pendingAgentRuns]);
   }
-  assertJsonSerializable(result, "workflow result");
+  const unawaitedRejections = pendingRejections.filter((reason) => {
+    if (isWorkflowPauseSignal(reason) && paused) return false;
+    return true;
+  });
+  if (unawaitedRejections.length > 0) {
+    log(`[warn] ${unawaitedRejections.length} unawaited agent() call(s) rejected`);
+    const first = unawaitedRejections[0];
+    if (isWorkflowPauseSignal(first)) throw first;
+    if (isAbortError(first)) throw first;
+    if (unawaitedRejections.length === 1) {
+      throw first instanceof Error ? first : new Error(String(first));
+    }
+    const messages = unawaitedRejections.map((reason) => (reason instanceof Error ? reason.message : String(reason)));
+    const aggregate = new Error(`${unawaitedRejections.length} unawaited agent calls rejected: ${messages.join("; ")}`);
+    throw aggregate;
+  }
+  if (!paused) assertJsonSerializable(result, "workflow result");
   return {
     meta,
-    result: result as T,
+    result: (paused ? null : result) as T,
     logs: state.logs,
     phases: state.phases,
     agentCount: state.agentCount,
     durationMs: Date.now() - started,
     agents: state.agents,
+    tokensSpent: state.spent,
+    paused,
   };
 }
 
@@ -567,10 +747,18 @@ function normalizeAgentOptions(value: unknown): AgentOptions {
     label: optionalString(options.label, "agent label"),
     phase: optionalString(options.phase, "agent phase"),
     model: optionalModelRef(options.model),
+    job: optionalNonEmptyString(options.job, "agent job"),
     thinkingLevel: optionalThinkingLevel(options.thinkingLevel),
     isolation: optionalIsolation(options.isolation),
     agentType: optionalString(options.agentType, "agent type"),
   };
+}
+
+function optionalNonEmptyString(value: unknown, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  const text = requireString(value, name);
+  if (!text.trim()) throw new TypeError(`${name} must be a non-empty string`);
+  return text;
 }
 
 function assertJsonSerializable(value: unknown, name: string): void {
@@ -628,6 +816,70 @@ function attachAgentError(
   };
 }
 
+class WorkflowConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkflowConfigurationError";
+  }
+}
+
+function isWorkflowConfigurationError(error: unknown): error is WorkflowConfigurationError {
+  return (
+    error instanceof WorkflowConfigurationError ||
+    (!!error && typeof error === "object" && (error as { name?: unknown }).name === "WorkflowConfigurationError")
+  );
+}
+
+class WorkflowLabelConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkflowLabelConflictError";
+  }
+}
+
+function isWorkflowLabelConflictError(error: unknown): error is WorkflowLabelConflictError {
+  return (
+    error instanceof WorkflowLabelConflictError ||
+    (!!error && typeof error === "object" && (error as { name?: unknown }).name === "WorkflowLabelConflictError")
+  );
+}
+
+class WorkflowInfrastructureError extends Error {
+  readonly cause?: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "WorkflowInfrastructureError";
+    this.cause = cause;
+  }
+}
+
+function isWorkflowInfrastructureError(error: unknown): error is WorkflowInfrastructureError {
+  return (
+    error instanceof WorkflowInfrastructureError ||
+    (!!error && typeof error === "object" && (error as { name?: unknown }).name === "WorkflowInfrastructureError")
+  );
+}
+
+class WorkflowPauseSignal extends Error {
+  readonly data?: unknown;
+  readonly key?: string;
+
+  constructor(message: string, data?: unknown, key?: string) {
+    super(message);
+    this.name = "WorkflowPauseSignal";
+    this.data = data;
+    this.key = key;
+  }
+}
+
+function isWorkflowPauseSignal(error: unknown): error is WorkflowPauseSignal {
+  return (
+    error instanceof WorkflowPauseSignal ||
+    (!!error && typeof error === "object" && (error as { name?: unknown }).name === "WorkflowPauseSignal")
+  );
+}
+
 function createAbortError(message: string): Error {
   const error = new Error(message);
   error.name = "AbortError";
@@ -636,4 +888,41 @@ function createAbortError(message: string): Error {
 
 function isAbortError(error: unknown): boolean {
   return !!error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError";
+}
+
+function stableJsonStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, val) => {
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      const sorted: Record<string, unknown> = {};
+      for (const k of Object.keys(val).sort()) {
+        sorted[k] = val[k as keyof typeof val];
+      }
+      return sorted;
+    }
+    return val;
+  });
+}
+
+function computeAgentFingerprint(
+  prompt: string,
+  phase: string | undefined,
+  label: string,
+  options: AgentOptions,
+): string {
+  const normalized = {
+    prompt,
+    phase,
+    label,
+    schema: options.schema,
+    model: options.model,
+    job: options.job,
+    thinkingLevel: options.thinkingLevel,
+    isolation: options.isolation,
+    agentType: options.agentType,
+  };
+  return createHash("sha256").update(stableJsonStringify(normalized)).digest("hex");
+}
+
+function computePauseKey(payloadHash: string, occurrence: number): string {
+  return `pause-${payloadHash}-${occurrence}`;
 }

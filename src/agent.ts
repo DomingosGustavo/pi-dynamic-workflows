@@ -14,6 +14,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
+import { DEFAULT_WORKFLOW_MODEL_CATALOG, selectWorkflowModel, type WorkflowModelCatalog } from "./model-selection.js";
 import type {
   WorkflowAgentRunMetadata,
   WorkflowModelRef,
@@ -38,6 +39,8 @@ export interface WorkflowAgentOptions {
   session?: Partial<CreateAgentSessionOptions>;
   /** Extra system guidance prepended to every subagent task. */
   instructions?: string;
+  /** Curated routing catalog used when an agent supplies job instead of model. */
+  modelCatalog?: WorkflowModelCatalog;
 }
 
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
@@ -47,6 +50,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   instructions?: string;
   signal?: AbortSignal;
   model?: WorkflowModelRef;
+  /** Select a model from the catalog. Explicit model always takes precedence. */
+  job?: string;
   thinkingLevel?: WorkflowThinkingLevel;
   isolation?: WorktreeIsolation;
   onMetadata?: (metadata: WorkflowAgentRunMetadata) => void;
@@ -62,12 +67,14 @@ export class WorkflowAgent {
   private readonly extraTools: ToolDefinition[];
   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
   private readonly instructions?: string;
+  private readonly modelCatalog: WorkflowModelCatalog;
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
     this.extraTools = options.tools ?? [];
     this.sessionOptions = options.session ?? {};
     this.instructions = options.instructions;
+    this.modelCatalog = options.modelCatalog ?? DEFAULT_WORKFLOW_MODEL_CATALOG;
   }
 
   async run<TSchemaDef extends TSchema | undefined = undefined>(
@@ -79,11 +86,23 @@ export class WorkflowAgent {
     const modelRegistry =
       this.sessionOptions.modelRegistry ??
       ModelRegistry.create(this.sessionOptions.authStorage ?? AuthStorage.create(join(agentDir, "auth.json")));
-    const resolvedModel = resolveWorkflowModel(modelRegistry, options.model);
+    const selected =
+      !options.model && options.job
+        ? selectWorkflowModel(
+            this.modelCatalog,
+            options.job,
+            typeof modelRegistry.getAvailable === "function" ? modelRegistry.getAvailable() : modelRegistry.getAll(),
+          )
+        : undefined;
+    const resolvedModel = resolveWorkflowModel(modelRegistry, options.model ?? selected?.model);
+    const thinkingLevel = options.thinkingLevel ?? selected?.thinkingLevel;
     const metadata: WorkflowAgentRunMetadata = {
       cwd: this.cwd,
       model: resolvedModel ? { provider: resolvedModel.provider, id: resolvedModel.id } : undefined,
-      thinkingLevel: options.thinkingLevel,
+      thinkingLevel,
+      modelSelection: selected
+        ? { job: selected.job, considered: selected.considered, reason: selected.reason }
+        : undefined,
       promptPreview: previewValue(prompt),
       activity: { kind: "starting", text: "starting", updatedAt: Date.now() },
     };
@@ -117,7 +136,7 @@ export class WorkflowAgent {
         customTools,
         ...this.sessionOptions,
         model: resolvedModel ?? this.sessionOptions.model,
-        thinkingLevel: options.thinkingLevel ?? this.sessionOptions.thinkingLevel,
+        thinkingLevel: thinkingLevel ?? this.sessionOptions.thinkingLevel,
         modelRegistry,
       });
 

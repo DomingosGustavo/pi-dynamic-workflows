@@ -1,0 +1,61 @@
+{
+  "$schema": "./model-selection.schema.json",
+  "version": 2,
+  "work": {
+    "inspection": [
+      { "model": "opencode-go/deepseek-v4-flash", "thinkingLevel": "low" },
+      { "model": "opencode-go/kimi-k2.7-code", "thinkingLevel": "medium" }
+    ],
+    "classification": [
+      { "model": "opencode-go/deepseek-v4-flash", "thinkingLevel": "low" },
+      { "model": "opencode-go/kimi-k2.7-code", "thinkingLevel": "low" }
+    ],
+    "research": [
+      { "model": "opencode-go/deepseek-v4-flash", "thinkingLevel": "low" },
+      { "model": "opencode-go/kimi-k2.7-code", "thinkingLevel": "medium" }
+    ],
+    "summarization": [
+      { "model": "opencode-go/deepseek-v4-flash", "thinkingLevel": "low" },
+      { "model": "opencode-go/minimax-m3", "thinkingLevel": "medium" }
+    ],
+    "implementation": [
+      { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "medium" },
+      { "model": "opencode-go/kimi-k2.7-code", "thinkingLevel": "high" },
+      { "model": "opencode-go/minimax-m3", "thinkingLevel": "high" }
+    ],
+    "exploration": [
+      { "model": "opencode-go/kimi-k2.7-code", "thinkingLevel": "medium" },
+      { "model": "opencode-go/minimax-m3", "thinkingLevel": "medium" }
+    ],
+    "synthesis": [
+      { "model": "opencode-go/minimax-m3", "thinkingLevel": "medium" },
+      { "model": "opencode-go/kimi-k2.7-code", "thinkingLevel": "medium" },
+      { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "medium" }
+    ],
+    "planning": [
+      { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "medium" },
+      { "model": "opencode-go/minimax-m3", "thinkingLevel": "high" }
+    ],
+    "review": [
+      { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "high" },
+      { "model": "opencode-go/glm-5.2", "thinkingLevel": "xhigh" },
+      { "model": "openai-codex/gpt-5.5", "thinkingLevel": "high" }
+    ],
+    "security-review": [
+      { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "high" },
+      { "model": "anthropic/claude-opus-4-8", "thinkingLevel": "xhigh" },
+      { "model": "opencode-go/glm-5.2", "thinkingLevel": "xhigh" }
+    ],
+    "judge": [
+      { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "high" },
+      { "model": "anthropic/claude-fable-5", "thinkingLevel": "high" },
+      { "model": "openai-codex/gpt-5.5", "thinkingLevel": "xhigh" },
+      { "model": "opencode-go/glm-5.2", "thinkingLevel": "xhigh" }
+    ],
+    "architecture": [
+      { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "high" },
+      { "model": "anthropic/claude-fable-5", "thinkingLevel": "high" },
+      { "model": "openai-codex/gpt-5.5", "thinkingLevel": "xhigh" }
+    ]
+  }
+}

@@ -17,6 +17,19 @@ export {
   renderWorkflowText,
 } from "./display.js";
 export type {
+  SelectableWorkflowModel,
+  WorkflowModelCandidate,
+  WorkflowModelCatalog,
+  WorkflowModelSelection,
+} from "./model-selection.js";
+export {
+  DEFAULT_WORKFLOW_MODEL_CATALOG,
+  modelRef,
+  parseWorkflowModelCatalog,
+  selectWorkflowModel,
+  workflowJobTypes,
+} from "./model-selection.js";
+export type {
   WorkflowAgentActivity,
   WorkflowAgentActivityKind,
   WorkflowAgentRunMetadata,
@@ -33,13 +46,20 @@ export type {
 } from "./options.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
-export type { SubagentToolInput, SubagentToolOptions } from "./subagent-tool.js";
+export type {
+  ResolvedSubagentTask,
+  SubagentTaskInput,
+  SubagentToolInput,
+  SubagentToolOptions,
+} from "./subagent-tool.js";
 export {
   buildDelegationPromptAppend,
+  buildParallelSubagentScript,
   buildSubagentScript,
   createSubagentTool,
   DELEGATION_PROMPT_APPEND,
   DELEGATION_PROMPT_MARKER,
+  resolveSubagentTasks,
 } from "./subagent-tool.js";
 export {
   activityFromSessionEvent,
@@ -54,10 +74,23 @@ export type {
   AgentOptions,
   WorkflowMeta,
   WorkflowMetaPhase,
+  WorkflowPauseInfo,
+  WorkflowResumeState,
   WorkflowRunOptions,
   WorkflowRunResult,
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
+export type {
+  PersistedWorkflowState,
+  WorkflowCompletedCheckpoint,
+  WorkflowStateEvent,
+  WorkflowStateStore,
+} from "./workflow-state.js";
+export {
+  isWorkflowStateEvent,
+  reduceWorkflowStateEvents,
+  WORKFLOW_SESSION_ENTRY_TYPE,
+} from "./workflow-state.js";
 export type { RunWorkflowScriptOptions, WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
 export {
   createWorkflowTool,

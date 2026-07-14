@@ -237,23 +237,26 @@ while (issues.length < 10) {
 return { issues: issues.slice(0, 10) };
 ```
 
-## 5. Budget-Scaled Loop
+## 5. Bounded-Rounds + Dry-Streak Loop
 
-Use when depth should scale to the user's token target. Keep a hard stop in case
-the target is absent or large.
+Use for discovery loops. Keep hard stops by item count, round cap, and dry
+streak so the loop terminates even if each round returns results.
 
 ```js
 const found = [];
 let rounds = 0;
-while (budget.total && budget.remaining() > 50_000 && rounds < 8) {
+let dryStreak = 0;
+while (found.length < 25 && rounds < 8 && dryStreak < 2) {
   rounds += 1;
-  const result = await agent("Find one more high-signal issue in this codebase.", {
+  const before = found.length;
+  const result = await agent("Find one more high-signal issue not already listed.", {
     label: `round:${rounds}`,
     model: "opencode-go/deepseek-v4-flash",
     schema: ISSUE_BATCH,
   });
   found.push(...(result?.issues ?? []));
-  log(`${found.length} found; ${Math.round(budget.remaining() / 1000)}k tokens left`);
+  dryStreak = found.length === before ? dryStreak + 1 : 0;
+  log(`${found.length} found; ${dryStreak} dry round(s)`);
 }
 
 return { rounds, found };
@@ -263,7 +266,7 @@ return { rounds, found };
 
 Set conservative hard stops: discovery loops run at most ~8 rounds or collect
 ~25 items; implement-review-fix loops run at most 3 rounds. Add a dry-streak
-break when consecutive rounds add nothing, and reserve budget for final
+break when consecutive rounds add nothing, and reserve capacity for final
 synthesis.
 
 ## 6. Judge Panel

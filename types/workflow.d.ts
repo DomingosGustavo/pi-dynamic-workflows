@@ -24,15 +24,18 @@ declare global {
     model?: string;
   }
 
-  interface WorkflowAgentOptions<TSchema = JsonSchema> {
+  /**
+   * Options shared by every agent() call, regardless of whether the model is
+   * chosen explicitly or routed from a job work type. The `model`/`job`
+   * requirement is layered on top by {@link WorkflowAgentOptions}.
+   */
+  interface WorkflowAgentBaseOptions<TSchema = JsonSchema> {
     /** Short label shown in the live progress UI. */
     label?: string;
     /** Override the current runtime phase for this agent. */
     phase?: string;
     /** JSON Schema for structured output. When present, the subagent returns a validated object instead of text. TypeScript cannot infer its shape from the schema literal, so annotate the result or pass a generic: `await agent<Finding>(prompt, { schema })`. */
     schema?: TSchema;
-    /** Requested Pi model for this subagent. Use provider/id when possible, for example `opencode-go/deepseek-v4-flash`. */
-    model?: WorkflowModelRef;
     /** Requested thinking level for this subagent. */
     thinkingLevel?: WorkflowThinkingLevel;
     /** Requested isolation mode. Worktree isolation is opt-in and does not merge changes back. */
@@ -45,6 +48,32 @@ declare global {
      */
     agentType?: string;
   }
+
+  /**
+   * Every agent() call must specify either an explicit `model` or a `job` work
+   * type; this union enforces that at least one is present at the type level.
+   * When both are given, the explicit model wins for execution.
+   *
+   * Unless a custom model catalog is configured, `job` must be one of the
+   * bundled work types: inspection, classification, research, summarization,
+   * implementation, exploration, synthesis, planning, review, security-review,
+   * judge, or architecture.
+   */
+  type WorkflowAgentOptions<TSchema = JsonSchema> = WorkflowAgentBaseOptions<TSchema> &
+    (
+      | {
+          /** Requested Pi model for this subagent. Use provider/id when possible, for example `opencode-go/deepseek-v4-flash`. */
+          model: WorkflowModelRef;
+          /** Bundled work type used to route a model when one is not given explicitly. */
+          job?: string;
+        }
+      | {
+          /** Requested Pi model for this subagent. Use provider/id when possible, for example `opencode-go/deepseek-v4-flash`. */
+          model?: WorkflowModelRef;
+          /** Bundled work type used when model is omitted: inspection, classification, research, summarization, implementation, exploration, synthesis, planning, review, security-review, judge, or architecture. */
+          job: string;
+        }
+    );
 
   type WorkflowModelRef =
     | string
@@ -86,12 +115,6 @@ declare global {
     [key: string]: unknown;
   }
 
-  interface WorkflowBudget {
-    total: number | null;
-    spent(): number;
-    remaining(): number;
-  }
-
   /**
    * Spawn a subagent.
    *
@@ -101,11 +124,11 @@ declare global {
    * gives no automatic inference — pass the expected result type explicitly:
    * `await agent<MyResult>(prompt, { schema })`.
    *
+   * Options are required and must include either `model` or `job`.
    * A failed branch resolves to `null` (a structured error record is attached to
-   * the agent's run metadata), so downstream reads should be null-safe.
+   * the agent's run metadata), so downstream reads must be null-safe.
    */
-  function agent(prompt: string): Promise<string>;
-  function agent<T = string>(prompt: string, options: WorkflowAgentOptions): Promise<T>;
+  function agent<T = string>(prompt: string, options: WorkflowAgentOptions): Promise<T | null>;
 
   /** Run independent async tasks concurrently. Pass functions, not already-created promises. */
   function parallel<T>(thunks: Array<() => Promise<T>>): Promise<T[]>;
@@ -118,6 +141,9 @@ declare global {
 
   /** Mark the current workflow phase for progress grouping. */
   function phase(title: string): void;
+
+  /** Cooperatively pause. Resume replays the script and reuses completed uniquely-labeled agents. */
+  function pause(reason?: string, data?: JsonValue): never;
 
   /** Append a workflow-level log line. */
   function log(message: unknown): void;
@@ -138,7 +164,4 @@ declare global {
 
   /** Trusted workflow process shim exposing cwd(). */
   const process: { cwd(): string };
-
-  /** Simple token-budget estimate for workflow runs. */
-  const budget: WorkflowBudget;
 }

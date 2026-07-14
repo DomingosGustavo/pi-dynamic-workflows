@@ -93,6 +93,11 @@ export interface WorkflowAgentRunMetadata {
     id: string;
   };
   thinkingLevel?: WorkflowThinkingLevel;
+  modelSelection?: {
+    job: string;
+    considered: string[];
+    reason: string;
+  };
   worktree?: WorkflowWorktreeMetadata;
   usage?: WorkflowTokenUsage;
   contextUsage?: WorkflowContextUsage;

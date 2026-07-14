@@ -21,7 +21,6 @@ const collected = [];
 let rounds = 0;
 const maxRounds = 8;
 
-// For budget-scaled loops: if (budget.total && budget.remaining() < 10_000) break;
 while (collected.length < 25 && rounds < maxRounds) {
   rounds += 1;
   const result = await agent("TODO: find more items not already listed.\n\n" + JSON.stringify(collected), {

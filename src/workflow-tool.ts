@@ -11,6 +11,7 @@ import {
   recomputeWorkflowSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
+import type { WorkflowModelCatalog } from "./model-selection.js";
 import type { WorkflowApprovalMode, WorkflowReviewMetadata } from "./options.js";
 import {
   parseWorkflowScript,
@@ -19,30 +20,34 @@ import {
   type WorkflowRunOptions,
   type WorkflowRunResult,
 } from "./workflow.js";
+import type { WorkflowCompletedCheckpoint, WorkflowStateStore } from "./workflow-state.js";
 
 const workflowToolSchema = Type.Object({
-  script: Type.String({
-    description: [
-      "Required raw JavaScript workflow script, with no Markdown fences.",
-      "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. meta.phases is optional documentation; live progress is driven by phase(title).",
-      "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, and budget. The workflow must call agent() at least once.",
-      "parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...))).",
-    ].join(" "),
-  }),
+  script: Type.Optional(
+    Type.String({
+      description: [
+        "Required raw JavaScript workflow script, with no Markdown fences.",
+        "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. meta.phases is optional documentation; live progress is driven by phase(title).",
+        "Use phase('Name'), pause(reason, data), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), and args. The workflow must call agent() at least once unless it pauses.",
+        "parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...))).",
+      ].join(" "),
+    }),
+  ),
+  resumeId: Type.Optional(
+    Type.String({
+      description:
+        "Resume by id, or use 'latest' for the newest paused/interrupted workflow on the active Pi session branch. Omit script.",
+    }),
+  ),
   args: Type.Optional(
     Type.Any({ description: "Optional JSON value exposed to the workflow script as global `args`." }),
-  ),
-  tokenBudget: Type.Optional(
-    Type.Union([Type.Number({ minimum: 0 }), Type.Null()], {
-      description: "Optional total token budget exposed as budget.total; null means unlimited.",
-    }),
   ),
 });
 
 export type WorkflowToolInput = {
-  script: string;
+  script?: string;
+  resumeId?: string;
   args?: unknown;
-  tokenBudget?: number | null;
 };
 
 const workflowDisplayOptions: WorkflowDisplayRunOptions = {
@@ -79,7 +84,9 @@ export interface RunWorkflowScriptOptions {
   cwd: string;
   args?: unknown;
   concurrency?: number;
-  tokenBudget?: number | null;
+  modelCatalog?: WorkflowModelCatalog;
+  resume?: WorkflowRunOptions["resume"];
+  onAgentCheckpoint?: WorkflowRunOptions["onAgentCheckpoint"];
   signal?: AbortSignal;
   review?: WorkflowReviewMetadata;
   displayOptions?: WorkflowDisplayRunOptions;
@@ -121,15 +128,16 @@ export async function runWorkflowScriptWithDisplay(
     if (!snapshot.phases.includes(title)) snapshot.phases.push(title);
   };
 
-  let result: WorkflowRunResult;
   try {
-    result = await runWorkflow(script, {
+    const result = await runWorkflow(script, {
       cwd: options.cwd,
       args: options.args,
       signal,
       agent: options.agent,
       concurrency: options.concurrency,
-      tokenBudget: options.tokenBudget,
+      modelCatalog: options.modelCatalog,
+      resume: options.resume,
+      onAgentCheckpoint: options.onAgentCheckpoint,
       session: {
         modelRegistry: (options.ctx as any).modelRegistry,
         model: (options.ctx as any).model,
@@ -193,6 +201,21 @@ export async function runWorkflowScriptWithDisplay(
         update();
       },
     });
+
+    if (result.agentCount === 0 && !result.paused) {
+      throw new Error(
+        "workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents",
+      );
+    }
+
+    snapshot.result = result.result;
+    snapshot.durationMs = result.durationMs;
+    snapshot.review = review;
+    snapshot = recomputeWorkflowSnapshot(snapshot);
+    if (result.paused) display.clear();
+    else display.complete(snapshot);
+
+    return { result, snapshot };
   } catch (error) {
     if (isAbortError(error)) {
       for (const agent of snapshot.agents) {
@@ -202,55 +225,63 @@ export async function runWorkflowScriptWithDisplay(
         }
       }
       snapshot = recomputeWorkflowSnapshot(snapshot);
-      display.complete(snapshot);
+      try {
+        display.complete(snapshot);
+      } catch {
+        // A UI cleanup failure must not replace the abort signal.
+      }
       throw createAbortError("Workflow was aborted");
+    }
+    // Non-abort failures (invalid return values or runtime errors) used to bypass complete(), leaving the last progress widget in
+    // Pi's TUI indefinitely. Clear it while preserving the original error.
+    try {
+      display.clear();
+    } catch {
+      // A UI cleanup failure must not replace the workflow's actual error.
     }
     throw error;
   }
-
-  if (result.agentCount === 0) {
-    throw new Error(
-      "workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents",
-    );
-  }
-
-  snapshot.result = result.result;
-  snapshot.durationMs = result.durationMs;
-  snapshot.review = review;
-  snapshot = recomputeWorkflowSnapshot(snapshot);
-  display.complete(snapshot);
-
-  return { result, snapshot };
 }
 
 export interface WorkflowToolOptions {
   cwd?: string;
   concurrency?: number;
-  tokenBudget?: number | null;
+  stateStore?: WorkflowStateStore;
+  /** Injectable agent runner for tests and embedded runtimes. */
+  agent?: RunWorkflowScriptOptions["agent"];
+  /** Override the bundled deterministic job-to-model routing catalog. */
+  modelCatalog?: WorkflowModelCatalog;
   approvalMode?: WorkflowApprovalMode;
   reviewDir?: string;
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
+  // Serialize workflow tool executions in one Pi runtime so sibling resume
+  // operations cannot race on the shared session state store.
+  let executionLock: Promise<unknown> = Promise.resolve();
+
   return defineTool({
     name: "workflow",
     label: "Workflow",
     description: [
-      "Execute trusted JavaScript workflow orchestration that coordinates multiple subagents with agent(), parallel(), and pipeline().",
-      "script is required raw JavaScript. It must start with export const meta = { name, description } and must call agent() at least once; phases are optional metadata.",
+      "Execute or resume trusted JavaScript workflow orchestration with session-backed checkpoints.",
+      "Pass script for a new workflow or resumeId for a paused/interrupted workflow on the active Pi session branch.",
     ].join(" "),
     promptSnippet:
-      "Run a trusted JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Use phase(title) at runtime to create progress groups.",
+      "Run or resume a trusted workflow. New scripts start with export const meta = { name, description }. Resume with resumeId (or 'latest'); completed uniquely-labeled agents are reused.",
     promptGuidelines: [
       "Use workflow when the user explicitly asks for a workflow, fan-out, or multi-agent orchestration, or when the task clearly decomposes into multiple agents (audits, multi-file changes, implement-then-review, fan-out research).",
       "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
       "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is optional metadata for a stable upfront outline.",
       "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax or static import/export statements after the meta export. Workflow JavaScript is trusted orchestration code with full host privileges under Pi's normal tool/session trust model; approval is not a sandbox.",
-      "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
-      "For workflow, agent options may include model, thinkingLevel, and isolation. Prefer enabled model refs such as provider/id when the task benefits from different model strengths.",
+      "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), pause(reason, data), log(message), args, cwd, process.cwd(), Every completed workflow must call agent() at least once; an explicit cooperative pause may occur before an agent.",
+      "For workflow, use pause(reason, data?) at safe phase boundaries when the user should review progress or the workflow should be resumed later.",
+      "For workflow resume, call the workflow tool with resumeId. The runtime replays the saved script and reuses completed agents by their unique stable labels, so all agent labels must be unique and deterministic.",
+      "For workflow, agent options require either model or job and may also include thinkingLevel and isolation. job is a plain work-type string, for example job: 'implementation'; an explicit model always wins when both are provided.",
+      "For workflow, bundled job work types are inspection, classification, research, summarization, implementation, exploration, synthesis, planning, review, security-review, judge, and architecture; candidates are tried in order against enabled Pi models.",
       "For workflow, dynamically choose the workflow shape, phase names, number of agents, and model assignments from the user's goal and repository context; do not reuse a fixed template when the task calls for a different decomposition.",
       "For workflow, default high-volume workhorse inspection/classification to opencode-go/deepseek-v4-flash when available; use opencode-go/kimi-k2.7-code or opencode-go/minimax-m3 for cheap agentic implementation, exploration, and synthesis.",
-      "For workflow, high-stakes review or judging should use independent judge agents with opencode-go/glm-5.2 as the lower-cost reasoning judge and either anthropic/claude-opus-4-8 or an enabled GPT 5.5 ref such as openai-codex/gpt-5.5 as the frontier judge, all with thinkingLevel: 'xhigh', then synthesize after comparing judgments.",
+      "For workflow, high-stakes review or judging should use independent judge agents: combine a routed frontier judge (for example openai-codex/gpt-5.6-sol or anthropic/claude-fable-5) with opencode-go/glm-5.2, anthropic/claude-opus-4-8, or openai-codex/gpt-5.5 as an independent perspective; use thinkingLevel: 'xhigh' where maximum independent scrutiny is justified, then synthesize after comparing judgments.",
       "For workflow, never let the same subagent implement and then review its own work. Use a separate reviewer agent, preferably a different model, and pass the implementer's structured output into the reviewer's prompt; the reviewer starts fresh, which removes confirmation bias.",
       "For workflow, use isolation: { mode: 'worktree', dirty: 'ignore', merge: 'none' } for read-only project audits when subagents should not touch the parent working tree.",
       "For workflow, when the user asks for a project audit, security review, or improvement review, put worktree isolation on every project-inspection agent; reserve non-isolated agents only for pure synthesis that does not inspect or mutate files.",
@@ -274,100 +305,249 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     prepareArguments(args) {
       return normalizeWorkflowToolArgs(args);
     },
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const script = normalizeWorkflowScript(params.script);
-      const parsed = parseWorkflowScript(script);
-      const cwd = options.cwd ?? ctx.cwd;
-      const approvalMode = options.approvalMode ?? "interactive";
-      let review = await prepareWorkflowReview(script, parsed.meta, cwd, {
-        approvalMode,
-        reviewDir: options.reviewDir,
-      });
-      onUpdate?.({
-        content: [{ type: "text", text: renderWorkflowReviewText(parsed.meta, review) }],
-        details: {
-          name: parsed.meta.name,
-          meta: parsed.meta,
-          review,
-        },
-      });
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const run = async () => {
+        let persisted = false;
+        let workflowId = "";
+        let workflowSucceeded = false;
+        let terminalPersisted = false;
+        let workflowResult: WorkflowRunResult | undefined;
+        try {
+          const saved = params.resumeId
+            ? params.resumeId === "latest"
+              ? options.stateStore
+                  ?.list()
+                  .filter((state) => state.status === "paused" || state.status === "interrupted")
+                  .sort((a, b) => a.updatedAt - b.updatedAt)
+                  .at(-1)
+              : options.stateStore?.get(params.resumeId)
+            : undefined;
+          if (params.resumeId && !options.stateStore) throw new Error("workflow resume requires a session state store");
+          if (params.resumeId && !saved) {
+            throw new Error(`Paused or interrupted workflow "${params.resumeId}" was not found on this session branch`);
+          }
+          if (saved?.status === "completed") throw new Error(`Workflow "${saved.id}" is already completed`);
 
-      if (signal?.aborted) throw createAbortError("Workflow was aborted");
-
-      if (approvalMode === "interactive") {
-        if (!ctx.hasUI) {
-          throw new Error(
-            "workflow approval requires an interactive UI; pass approvalMode: 'auto' only for trusted automation",
-          );
-        }
-        const approved = await ctx.ui.confirm(
-          "Run workflow?",
-          [
-            `Review file: ${review.path}`,
-            "",
-            `Run workflow "${parsed.meta.name}" now?`,
-            "This trusted JavaScript runs with full host privileges; approval is not a sandbox.",
-            "Rejecting leaves the review file in place and starts no agents.",
-          ].join("\n"),
-          signal ? { signal } : undefined,
-        );
-        review = approved
-          ? { ...review, approved: true, status: "approved" }
-          : { ...review, approved: false, status: "rejected" };
-        if (!approved) {
-          const snapshot = recomputeWorkflowSnapshot({
-            ...createWorkflowSnapshot(parsed.meta),
-            review,
+          const script = normalizeWorkflowScript(saved?.script ?? params.script ?? "");
+          const runArgs = saved ? saved.args : params.args;
+          const parsed = parseWorkflowScript(script);
+          workflowId = saved?.id ?? `${slugWorkflowName(parsed.meta.name)}-${toolCallId || randomUUID()}`;
+          const cwd = options.cwd ?? ctx.cwd;
+          const approvalMode = options.approvalMode ?? "interactive";
+          let review = await prepareWorkflowReview(script, parsed.meta, cwd, {
+            approvalMode,
+            reviewDir: options.reviewDir,
           });
+          onUpdate?.({
+            content: [{ type: "text", text: renderWorkflowReviewText(parsed.meta, review) }],
+            details: {
+              name: parsed.meta.name,
+              meta: parsed.meta,
+              review,
+            },
+          });
+
+          if (signal?.aborted) throw createAbortError("Workflow was aborted");
+
+          if (approvalMode === "interactive") {
+            if (!ctx.hasUI) {
+              throw new Error(
+                "workflow approval requires an interactive UI; pass approvalMode: 'auto' only for trusted automation",
+              );
+            }
+            const approved = await ctx.ui.confirm(
+              saved ? "Resume workflow?" : "Run workflow?",
+              [
+                `Review file: ${review.path}`,
+                "",
+                `${saved ? "Resume" : "Run"} workflow "${parsed.meta.name}" now?`,
+                "This trusted JavaScript runs with full host privileges; approval is not a sandbox.",
+                "Rejecting leaves the review file in place and starts no agents.",
+              ].join("\n"),
+              signal ? { signal } : undefined,
+            );
+            review = approved
+              ? { ...review, approved: true, status: "approved" }
+              : { ...review, approved: false, status: "rejected" };
+            if (!approved) {
+              const snapshot = recomputeWorkflowSnapshot({
+                ...createWorkflowSnapshot(parsed.meta),
+                review,
+              });
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Workflow ${parsed.meta.name} was not run. Review file: ${review.path}`,
+                  },
+                ],
+                details: {
+                  ...snapshot,
+                  meta: parsed.meta,
+                  review,
+                  phases: [],
+                  logs: [],
+                },
+              };
+            }
+          } else {
+            review = { ...review, approved: true, status: "auto" };
+          }
+
+          if (saved) {
+            await options.stateStore?.append({
+              kind: "resumed",
+              workflowId,
+              timestamp: Date.now(),
+            });
+          } else {
+            await options.stateStore?.append({
+              kind: "created",
+              workflowId,
+              script,
+              args: runArgs,
+              meta: parsed.meta,
+              timestamp: Date.now(),
+            });
+          }
+          persisted = true;
+
+          const { result, snapshot } = await runWorkflowScriptWithDisplay(script, parsed.meta, {
+            cwd,
+            args: runArgs,
+            concurrency: options.concurrency,
+            agent: options.agent,
+            modelCatalog: options.modelCatalog,
+            resume: saved
+              ? {
+                  workflowId,
+                  tokensSpent: saved.tokensSpent,
+                  completed: saved.completed,
+                  acknowledgedPauseKeys: saved.acknowledgedPauseKeys ?? [],
+                }
+              : { workflowId, tokensSpent: 0, completed: {} },
+            async onAgentCheckpoint(checkpoint: WorkflowCompletedCheckpoint, tokensSpent: number) {
+              await options.stateStore?.append({
+                kind: "agent_completed",
+                workflowId,
+                checkpoint,
+                tokensSpent,
+                timestamp: Date.now(),
+              });
+            },
+            signal,
+            review,
+            onUpdate,
+            ctx,
+          });
+          workflowResult = result;
+
+          workflowSucceeded = true;
+          if (result.paused) {
+            await options.stateStore?.append({
+              kind: "paused",
+              workflowId,
+              reason: result.paused.reason,
+              data: result.paused.data,
+              key: result.paused.key,
+              tokensSpent: result.tokensSpent,
+              timestamp: Date.now(),
+            });
+            terminalPersisted = true;
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Workflow ${result.meta.name} paused. Resume id: ${workflowId}\nReason: ${result.paused.reason}`,
+                },
+              ],
+              details: {
+                ...snapshot,
+                meta: result.meta,
+                paused: result.paused,
+                resumeId: workflowId,
+                phases: result.phases,
+                logs: result.logs,
+                agentRecords: result.agents,
+                review,
+              },
+            };
+          }
+
+          await options.stateStore?.append({
+            kind: "completed",
+            workflowId,
+            tokensSpent: result.tokensSpent,
+            timestamp: Date.now(),
+          });
+          terminalPersisted = true;
           return {
             content: [
               {
                 type: "text",
-                text: `Workflow ${parsed.meta.name} was not run. Review file: ${review.path}`,
+                text: `Workflow ${result.meta.name} completed with ${result.agentCount} agent(s).\n\nResult:\n${JSON.stringify(result.result, null, 2)}`,
               },
             ],
             details: {
               ...snapshot,
-              meta: parsed.meta,
+              meta: result.meta,
+              workflowId,
+              phases: result.phases,
+              logs: result.logs,
+              result: result.result,
+              durationMs: result.durationMs,
+              agentRecords: result.agents,
               review,
-              phases: [],
-              logs: [],
             },
           };
+        } catch (error) {
+          // Always best-effort append an interrupted event once the workflow was
+          // persisted, so the state store never stays stuck in 'running' (which
+          // would make the workflow unresumable via resumeId or 'latest'). When
+          // the workflow succeeded but persisting the terminal paused/completed
+          // event failed, record that the terminal state persistence failed
+          // while still rethrowing the ORIGINAL error below.
+          if (persisted) {
+            let tokensSpent: number | undefined;
+            try {
+              tokensSpent = options.stateStore?.get(workflowId)?.tokensSpent;
+            } catch {
+              // The store may be flaky while we are already handling a failure.
+              // Fall back to the last known tokens spent from the workflow run,
+              // or zero if the workflow never produced a result.
+              tokensSpent = workflowResult?.tokensSpent ?? 0;
+            }
+            let reason: string;
+            try {
+              reason =
+                workflowSucceeded && !terminalPersisted
+                  ? `terminal state persistence failed: ${sanitizeInterruptionReason(error)}`
+                  : sanitizeInterruptionReason(error);
+            } catch {
+              // The thrown value is hostile (e.g. a throwing getter or
+              // toString). Use a safe fallback so the interrupted event is
+              // still appended and the original error is rethrown below.
+              reason = "interrupted";
+            }
+            try {
+              await options.stateStore?.append({
+                kind: "interrupted",
+                workflowId,
+                reason,
+                tokensSpent: tokensSpent ?? 0,
+                timestamp: Date.now(),
+              });
+            } catch {
+              // Interruption persistence is best-effort; if the terminal append
+              // already failed the retry may also fail. Preserve the workflow's
+              // original failure rather than masking it.
+            }
+          }
+          throw error;
         }
-      } else {
-        review = { ...review, approved: true, status: "auto" };
-      }
-
-      const { result, snapshot } = await runWorkflowScriptWithDisplay(script, parsed.meta, {
-        cwd,
-        args: params.args,
-        concurrency: options.concurrency,
-        tokenBudget: params.tokenBudget !== undefined ? params.tokenBudget : options.tokenBudget,
-        signal,
-        review,
-        onUpdate,
-        ctx,
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Workflow ${result.meta.name} completed with ${result.agentCount} agent(s).\n\nResult:\n${JSON.stringify(result.result, null, 2)}`,
-          },
-        ],
-        details: {
-          ...snapshot,
-          meta: result.meta,
-          phases: result.phases,
-          logs: result.logs,
-          result: result.result,
-          durationMs: result.durationMs,
-          agentRecords: result.agents,
-          review,
-        },
       };
+      executionLock = executionLock.then(run, run);
+      return executionLock as Promise<any>;
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("workflow")), 0, 0);
@@ -380,21 +560,18 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 }
 
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
-  if (!args || typeof args !== "object") throw new Error("workflow requires an object argument with a script string");
+  if (!args || typeof args !== "object") throw new Error("workflow requires an object argument");
   const value = args as Record<string, unknown>;
-  if (typeof value.script !== "string") throw new Error("workflow requires `script` to be a string");
+  const hasScript = typeof value.script === "string";
+  const hasResume = typeof value.resumeId === "string" && value.resumeId.trim().length > 0;
+  if (hasScript === hasResume) throw new Error("workflow requires exactly one of `script` or `resumeId`");
+  if (value.args !== undefined && hasResume)
+    throw new Error("workflow resume uses the saved args; do not pass args again");
   return {
     ...value,
-    script: normalizeWorkflowScript(value.script),
-    tokenBudget: normalizeTokenBudget(value.tokenBudget),
+    script: hasScript ? normalizeWorkflowScript(value.script as string) : undefined,
+    resumeId: hasResume ? (value.resumeId as string).trim() : undefined,
   } as WorkflowToolInput;
-}
-
-function normalizeTokenBudget(value: unknown): number | null | undefined {
-  if (value === undefined) return undefined;
-  if (value === null) return null;
-  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
-  throw new Error("workflow tokenBudget must be a non-negative finite number or null");
 }
 
 function normalizeWorkflowScript(script: string): string {
@@ -518,6 +695,35 @@ function createAbortError(message: string): Error {
 
 function isAbortError(error: unknown): boolean {
   return !!error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError";
+}
+
+function safeStringifyInterruptionReason(error: unknown): string {
+  try {
+    if (error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError") {
+      return "aborted";
+    }
+  } catch {
+    // Hostile `name` getter; fall through to a safe stringification.
+  }
+
+  try {
+    if (error instanceof Error) {
+      return String(error.message);
+    }
+    return String(error);
+  } catch {
+    try {
+      return Object.prototype.toString.call(error);
+    } catch {
+      return "interrupted";
+    }
+  }
+}
+
+function sanitizeInterruptionReason(error: unknown): string {
+  const raw = safeStringifyInterruptionReason(error);
+  const sanitized = raw.replace(/[\r\n]+/g, " ").slice(0, 200);
+  return sanitized || "interrupted";
 }
 
 function findSnapshotAgent(snapshot: WorkflowSnapshot, id: number, status?: "running") {

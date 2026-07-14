@@ -20,6 +20,8 @@
     "skills/",
     "src/",
     "types/",
+    "model-selection.json",
+    "model-selection.schema.json",
     "README.md"
   ],
   "scripts": {

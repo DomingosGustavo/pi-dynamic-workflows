@@ -24,14 +24,14 @@ That's it. The extension registers a `workflow` tool and a `subagent` tool and a
 
 ## Subagent tool
 
-`subagent` is the lightweight sibling of `workflow`: one narrow, self-contained task delegated to a single agent, with no approval prompt. It is the right tool when a full multi-agent workflow is overkill but the task is still worth handing off.
+`subagent` is the lightweight sibling of `workflow`: narrow, self-contained tasks delegated with no approval prompt. Pass `task` for a single agent, or `tasks` for several independent agents running in parallel. It is the right tool when a full multi-agent workflow is overkill but the work is still worth handing off.
 
-The caller (the parent model) picks the model and thinking level per the same model-selection guidelines the workflow tool uses — e.g. `opencode-go/kimi-k2.7-code` at `medium` for routine implementation, `openai-codex/gpt-5.5` or `anthropic/claude-opus-4-8` at `high` for frontier-difficulty debugging or architecture.
+The caller (the parent model) picks the model by the kind of work — e.g. `opencode-go/deepseek-v4-flash` for high-volume inspection and research, `opencode-go/kimi-k2.7-code` or `opencode-go/minimax-m3` for implementation and exploration, `openai-codex/gpt-5.6-sol` at `high` (with `anthropic/claude-fable-5` or `openai-codex/gpt-5.5` as alternatives) for review, judging, and architecture.
 
 Under the hood it reuses the exact same machinery as `workflow`:
 
-- it generates a one-agent workflow script and writes it to `.pi/workflows/` as an inspectable artifact (auto-approved, no confirmation prompt),
-- the task prompt is passed via `args.task`, and the agent runs as a fresh in-memory Pi subagent session with the standard coding tools,
+- it generates a one-agent (or, with `tasks`, a `parallel()` fan-out) workflow script and writes it to `.pi/workflows/` as an inspectable artifact (auto-approved, no confirmation prompt),
+- the task prompt is passed via `args.task` (or the resolved task list via `args.tasks`), and each agent runs as a fresh in-memory Pi subagent session with the standard coding tools,
 - live progress renders in the same TUI panel as workflows (model, thinking level, activity, token/cost usage),
 - `Esc` aborts the run like any workflow.
 
@@ -42,6 +42,8 @@ Under the hood it reuses the exact same machinery as `workflow`:
 ```
 
 Task prompts must be self-contained: the subagent does not inherit the parent conversation.
+
+With `tasks`, each entry may override `model`, `thinkingLevel`, and `label` (top-level values act as defaults). Tasks must be independent of each other; results come back as one labeled section per task, in task order, with failed tasks reported inline as `FAILED: <message>` (the call only rejects if every task fails).
 
 ## Workflow Creator Skill
 
@@ -104,6 +106,7 @@ export const meta = {
 phase('Scan')
 const inventory = await agent('Inspect the repository structure.', {
   label: 'repo inventory',
+  job: 'inspection',
 })
 
 phase('Analyze')
@@ -121,6 +124,31 @@ return { inventory, summary }
 ```
 
 Phases are discovered as the script runs, so conditional and loop-created phases work naturally. If a branch is skipped, its phase does not show up as an empty progress row.
+
+## Deterministic model routing
+
+Workflows can describe the job instead of hard-coding a model. The runtime reads
+[`model-selection.json`](model-selection.json), looks up the work type, and
+selects the first enabled candidate from Pi's model registry:
+
+```js
+const report = await agent('Review the authentication changes.', {
+  label: 'auth review',
+  job: 'security-review',
+})
+```
+
+Selection is deterministic: work-type catalog order, then candidate order. The
+first enabled provider/id wins. An unknown work type throws synchronously and
+fails the whole workflow. An explicit `model` always takes precedence, and an
+explicit `thinkingLevel` overrides the selected candidate's level.
+
+Bundled work types: `inspection`, `classification`, `research`, `summarization`,
+`implementation`, `exploration`, `synthesis`, `planning`, `review`,
+`security-review`, `judge`, `architecture`. Every `agent()` call MUST declare
+`model` or `job`; the bundled skill validator enforces this.
+
+The versioned schema is [`model-selection.schema.json`](model-selection.schema.json). Applications embedding the tool can supply a different parsed catalog with `createWorkflowTool({ modelCatalog })`. The standalone `selectWorkflowModel(catalog, job, availableModels)` API is useful for validation, previews, and offline evals.
 
 ## Workflow design principles
 
@@ -140,7 +168,7 @@ Reusable workflow files can opt into editor hints for workflow globals:
 /// <reference types="pi-dynamic-workflows/workflow" />
 ```
 
-This declares `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `cwd`, and `budget` for TypeScript-aware editors.
+This declares `agent`, `parallel`, `pipeline`, `phase`, `pause`, `log`, `args`, and `cwd` for TypeScript-aware editors.
 
 ### Available globals
 
@@ -150,11 +178,36 @@ This declares `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `cwd`, an
 | `parallel(thunks)` | Run an array of `() => agent(...)` thunks concurrently. Results are returned in input order. Use as a barrier when all results are needed before the next step (synthesis, dedup, ranking). |
 | `pipeline(items, ...stages)` | Run each item through sequential stages while items fan out. Each stage receives `(prev, original, index)`. Use as the default multi-stage shape when each item can advance independently. |
 | `phase(title)` | Mark the current phase. Used for grouping in the live progress view. |
+| `pause(reason, data?)` | Persist a cooperative pause that can be resumed later. |
 | `log(message)` | Append a workflow-level log line. |
 | `args` | Optional JSON value passed in via the tool's `args` parameter. |
 | `cwd`, `process.cwd()` | Current working directory for subagents. |
-| `budget` | `{ total, spent(), remaining() }` token budget tracker. `total` is the tool's `tokenBudget` input (non-null when provided) or `null`. |
 | `console` | `log`/`info`/`warn`/`error` routed to workflow logs. |
+
+### Session-backed pause and resume
+
+Workflow progress is stored as append-only custom entries in the active Pi session. Completed agents are checkpointed by their unique label. This naturally follows Pi's session tree: resuming, forking, or using `/tree` only exposes workflow checkpoints on the active branch.
+
+Pause explicitly at a safe boundary:
+
+```js
+const inventory = await agent('Inventory the repository.', {
+  label: 'repo inventory',
+  job: 'inspection',
+})
+
+pause('Review the inventory before implementation', { inventory })
+```
+
+The tool returns a `resumeId`. Resume later with:
+
+```json
+{ "resumeId": "the-returned-id" }
+```
+
+Use `"latest"` to resume the newest paused or interrupted workflow on the current session branch. A resumed workflow replays its saved script from the beginning, but completed uniquely-labeled `agent()` calls return their saved result instead of running again. Each checkpoint carries a deterministic fingerprint over the replay-relevant invocation (prompt, phase, label, schema, model/job, thinking level, isolation, agent type); changing any of these invalidates the checkpoint and causes resume to fail clearly rather than reuse stale work. Failed agents run again. Explicit `pause(reason, data?)` pauses are keyed by a stable hash of reason + data plus an occurrence counter, so acknowledged pauses are skipped on replay; interrupted workflows resume from the last saved checkpoint.
+
+This is replay with memoized agent results, not serialized JavaScript continuation state. Code outside `agent()` runs again. Keep control flow deterministic, use stable unique labels, and ensure external side effects are idempotent or already present. Labels are reserved synchronously, so duplicates are rejected reliably even inside `parallel()`; own-key labels such as `__proto__` are safe.
 
 Failed branches resolve to `null` — filter with `.filter(Boolean)` and log the gaps before passing results downstream. A failed agent still records a structured error (`{ name, message, stack? }`) on its run metadata, so the failure stays inspectable in the workflow artifacts. Aborting a run (for example with `Esc`) rejects in-flight agents with an `AbortError` and stops the whole workflow rather than turning aborts into `null` branches.
 
@@ -193,6 +246,7 @@ Pass a JSON Schema via `opts.schema` and the subagent will return a validated ob
 ```js
 const finding = await agent('Find security-sensitive files.', {
   label: 'security scan',
+  job: 'security-review',
   schema: {
     type: 'object',
     properties: {
@@ -249,7 +303,7 @@ Parser unit tests live in `tests/workflow-parser.test.ts` and cover both accepte
 
 ## Status
 
-This is a prototype. It implements the core workflow primitive (script, subagents, parallel/pipeline, phases, abort, structured output) but does not yet implement persisted or resumable runs, or a `/workflows` manager.
+This is a prototype. It implements the core workflow primitive (script, subagents, parallel/pipeline, phases, abort, structured output) and session-backed pause/resume with checkpointed labeled agents. It does not yet implement a `/workflows` manager.
 
 ## License
 

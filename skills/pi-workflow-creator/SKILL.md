@@ -29,7 +29,20 @@ Deep reference material is split by need:
    `pipeline(items, ...stages)` lets each item advance as soon as it is ready. Use `parallel(thunks)` as a barrier only when the next step needs all previous results together for deduping, merging, scoring, counting, or synthesis. Choose `pipeline()` when items are independent and stages are sequential: fast items are not blocked by slow ones, and one slow stage does not make every other item wait. With many items (more than ~20) and cheap stages, pipeline avoids the barrier tax; if one stage is much slower than others, pipeline lets fast items skip the wait.
 
 4. Choose models deliberately.
-   Use enabled provider/id refs, not provider-specific aliases. Default cheap workhorse repo scans to `opencode-go/deepseek-v4-flash`. Use `opencode-go/kimi-k2.7-code` or `opencode-go/minimax-m3` for cheap agentic implementation/exploration. Use `opencode-go/glm-5.2` with `thinkingLevel: "xhigh"` as the lower-cost reasoning/judge alternative. Use a frontier judge such as `anthropic/claude-opus-4-8` or an enabled GPT 5.5 ref such as `openai-codex/gpt-5.5` with `thinkingLevel: "xhigh"` when the judgment is high stakes.
+   Every `agent()` call MUST declare either an explicit `model` provider/id or a `job: '<work-type>'` string. The validator enforces this. The runtime selects the first enabled candidate from the v2 work-type catalog:
+   - `inspection`: `opencode-go/deepseek-v4-flash` (low), `opencode-go/kimi-k2.7-code` (medium)
+   - `classification`: `opencode-go/deepseek-v4-flash` (low), `opencode-go/kimi-k2.7-code` (low)
+   - `research`: `opencode-go/deepseek-v4-flash` (low), `opencode-go/kimi-k2.7-code` (medium)
+   - `summarization`: `opencode-go/deepseek-v4-flash` (low), `opencode-go/minimax-m3` (medium)
+   - `implementation`: `opencode-go/kimi-k2.7-code` (high), `opencode-go/minimax-m3` (high), `openai-codex/gpt-5.6-sol` (medium)
+   - `exploration`: `opencode-go/kimi-k2.7-code` (medium), `opencode-go/minimax-m3` (medium)
+   - `synthesis`: `opencode-go/minimax-m3` (medium), `opencode-go/kimi-k2.7-code` (medium), `openai-codex/gpt-5.6-sol` (medium)
+   - `planning`: `openai-codex/gpt-5.6-sol` (medium), `opencode-go/minimax-m3` (high)
+   - `review`: `openai-codex/gpt-5.6-sol` (high), `opencode-go/glm-5.2` (xhigh), `openai-codex/gpt-5.5` (high)
+   - `security-review`: `openai-codex/gpt-5.6-sol` (high), `anthropic/claude-opus-4-8` (xhigh), `opencode-go/glm-5.2` (xhigh)
+   - `judge`: `openai-codex/gpt-5.6-sol` (high), `anthropic/claude-fable-5` (high), `openai-codex/gpt-5.5` (xhigh), `opencode-go/glm-5.2` (xhigh)
+   - `architecture`: `openai-codex/gpt-5.6-sol` (high), `anthropic/claude-fable-5` (high), `openai-codex/gpt-5.5` (xhigh)
+   An explicit `model` always wins. An unknown work type is a runtime error. Default cheap workhorse repo scans to `opencode-go/deepseek-v4-flash`; keep `opencode-go/kimi-k2.7-code` or `opencode-go/minimax-m3` for routine agentic implementation/exploration. Use `opencode-go/glm-5.2`, `anthropic/claude-opus-4-8`, or `openai-codex/gpt-5.5` for independent judging perspectives.
 
 5. Write plain JavaScript with a literal first statement:
 
@@ -44,8 +57,11 @@ export const meta = {
 6. Give every `agent()` a short unique `label`, enough task context, and the right options.
    Use `schema` whenever JavaScript reads fields from an agent result. Use `isolation: { mode: "worktree", dirty: "ignore", merge: "none" }` for project-inspection agents when the parent working tree must remain untouched.
 
-7. Validate before returning.
-   Run the bundled validator. Then, when possible, test the script with the Pi workflow tool or a unit harness using `approvalMode: "auto"` only for trusted automation.
+7. Design resumable boundaries.
+   Give every agent a stable unique label. Use `pause(reason, data?)` only after awaited work reaches a safe checkpoint. Resuming replays the script and reuses completed labeled agents from the active Pi session branch; each checkpoint carries a replay fingerprint, so do not change prompts, phases, schemas, models/jobs, thinking levels, isolation, or agent types across resume. Code outside agents runs again, so keep it deterministic and side effects idempotent. Explicit pauses are keyed by a stable hash of reason + data plus an occurrence counter, so acknowledged pauses are skipped on replay; interrupted workflows resume from the last saved checkpoint.
+
+8. Validate before returning.
+   Run the bundled validator; it checks the first literal `meta` export, import/require usage, nondeterministic calls, and now requires every `agent()` to pass an options object containing `model` or `job`. Then, when possible, test the script with the Pi workflow tool or a unit harness using `approvalMode: "auto"` only for trusted automation.
 
 ## Gotchas
 

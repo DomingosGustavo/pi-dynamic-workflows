@@ -12,17 +12,47 @@ unless the local Pi model registry explicitly documents them.
 > workflow full of unknown refs will quietly produce all-`null` results. Confirm
 > the refs first.
 
-## Defaults
+## V2 Work-Type Catalog
 
-| Need | Recommended model | Thinking |
-| --- | --- | --- |
-| High-volume repo scan, summarization, classification | `opencode-go/deepseek-v4-flash` | `low` to `medium` |
-| Cheap agentic implementation or exploration | `opencode-go/kimi-k2.7-code` | `medium` to `high` |
-| Cheap agentic alternative with broad synthesis | `opencode-go/minimax-m3` | `medium` to `high` |
-| Lower-cost reasoning or judge | `opencode-go/glm-5.2` | `xhigh` |
-| Frontier judge or critical reasoning | `anthropic/claude-opus-4-8` or enabled GPT 5.5 ref such as `openai-codex/gpt-5.5` | `xhigh` |
+Every `agent()` call MUST declare either `model` or `job: '<work-type>'`. An
+explicit `model` always wins. When `job` is given, the runtime looks up the work
+type and selects the first candidate whose provider/id is enabled in Pi's
+registry. An unknown work type throws synchronously and fails the whole workflow.
 
-## Selection Rules
+| Work type | Candidates (ordered) |
+| --- | --- |
+| `inspection` | `opencode-go/deepseek-v4-flash` (low), `opencode-go/kimi-k2.7-code` (medium) |
+| `classification` | `opencode-go/deepseek-v4-flash` (low), `opencode-go/kimi-k2.7-code` (low) |
+| `research` | `opencode-go/deepseek-v4-flash` (low), `opencode-go/kimi-k2.7-code` (medium) |
+| `summarization` | `opencode-go/deepseek-v4-flash` (low), `opencode-go/minimax-m3` (medium) |
+| `implementation` | `opencode-go/kimi-k2.7-code` (high), `opencode-go/minimax-m3` (high), `openai-codex/gpt-5.6-sol` (medium) |
+| `exploration` | `opencode-go/kimi-k2.7-code` (medium), `opencode-go/minimax-m3` (medium) |
+| `synthesis` | `opencode-go/minimax-m3` (medium), `opencode-go/kimi-k2.7-code` (medium), `openai-codex/gpt-5.6-sol` (medium) |
+| `planning` | `openai-codex/gpt-5.6-sol` (medium), `opencode-go/minimax-m3` (high) |
+| `review` | `openai-codex/gpt-5.6-sol` (high), `opencode-go/glm-5.2` (xhigh), `openai-codex/gpt-5.5` (high) |
+| `security-review` | `openai-codex/gpt-5.6-sol` (high), `anthropic/claude-opus-4-8` (xhigh), `opencode-go/glm-5.2` (xhigh) |
+| `judge` | `openai-codex/gpt-5.6-sol` (high), `anthropic/claude-fable-5` (high), `openai-codex/gpt-5.5` (xhigh), `opencode-go/glm-5.2` (xhigh) |
+| `architecture` | `openai-codex/gpt-5.6-sol` (high), `anthropic/claude-fable-5` (high), `openai-codex/gpt-5.5` (xhigh) |
+
+Full provider refs: `opencode-go/deepseek-v4-flash`, `opencode-go/kimi-k2.7-code`,
+`opencode-go/minimax-m3`, `opencode-go/glm-5.2`, `openai-codex/gpt-5.6-sol`,
+`openai-codex/gpt-5.5`, `anthropic/claude-opus-4-8`, `anthropic/claude-fable-5`.
+
+### Using `job`
+
+Use `job` when a reusable workflow should adapt to the enabled local registry:
+
+```js
+await agent("Review the authentication changes.", {
+  label: "auth review",
+  job: "security-review",
+});
+```
+
+The selected candidate's `thinkingLevel` is used unless you override it with an
+explicit `thinkingLevel` option.
+
+### Selection Rules
 
 - Default broad inspection workers to `opencode-go/deepseek-v4-flash`.
 - Use `opencode-go/kimi-k2.7-code` for cheap implementation, code navigation,
@@ -52,7 +82,7 @@ await agent("Inventory source modules and risks.", {
 
 await agent("Implement the smallest safe fix for the failing tests.", {
   label: "implement fix",
-  model: "opencode-go/kimi-k2.7-code",
+  job: "implementation",
   thinkingLevel: "high",
   isolation: { mode: "worktree", dirty: "patch", merge: "none", keep: "onError" },
 });
@@ -84,7 +114,8 @@ await agent("Independently judge the same finding for release-blocking risk.", {
 ## Phase Metadata
 
 `meta.phases[].model` is documentation for review readability. It does not set a
-runtime model by itself. Always set the actual model on each `agent()` call.
+runtime model by itself. Always set the actual model or job on each `agent()`
+call.
 
 ```js
 export const meta = {

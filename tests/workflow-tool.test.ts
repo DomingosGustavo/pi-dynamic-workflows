@@ -3,7 +3,9 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { recomputeWorkflowSnapshot } from "../src/display.js";
+import { reduceWorkflowStateEvents, type WorkflowStateEvent, type WorkflowStateStore } from "../src/workflow-state.js";
 import {
   createWorkflowTool,
   prepareWorkflowReview,
@@ -14,7 +16,8 @@ import {
 test("createWorkflowTool describes phases as optional and dynamic", () => {
   const tool = createWorkflowTool();
 
-  assert.match(tool.promptSnippet ?? "", /export const meta = \{ name: 'short_snake_case', description:/);
+  assert.match(tool.promptSnippet ?? "", /export const meta = \{ name, description \}/);
+  assert.match(tool.promptSnippet ?? "", /resumeId/);
   assert.doesNotMatch(tool.promptSnippet ?? "", /phases: \[/);
   assert.ok(tool.promptGuidelines?.some((line) => line.includes("meta.phases is optional metadata")));
   assert.ok(tool.promptGuidelines?.some((line) => line.includes("Phase names may be conditional or built in a loop")));
@@ -126,7 +129,7 @@ test("createWorkflowTool rejection returns review metadata and starts no agents"
   const tool = createWorkflowTool({ cwd });
   const script = `
     export const meta = { name: 'needs_review', description: 'Needs approval' }
-    const value = await agent('This must not run', { label: 'should not run' })
+    const value = await agent('This must not run', { model: 'test/model', label: 'should not run' })
     return { value }
   `;
 
@@ -160,7 +163,8 @@ test("createWorkflowTool rejection returns review metadata and starts no agents"
 test("createWorkflowTool interactive mode fails clearly without UI", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "workflow-no-ui-"));
   const tool = createWorkflowTool({ cwd });
-  const script = "export const meta = { name: 'no_ui', description: 'No UI' }\nreturn await agent('x', { label: 'x' })";
+  const script =
+    "export const meta = { name: 'no_ui', description: 'No UI' }\nreturn await agent('x', { model: 'test/model', label: 'x' })";
 
   try {
     await assert.rejects(
@@ -182,7 +186,7 @@ test("runWorkflowScriptWithDisplay completes a happy path with a fake agent runn
   const meta = { name: "display_happy", description: "Run with fake agent" };
   const script = `export const meta = { name: 'display_happy', description: 'Run with fake agent' }
 phase('Scan')
-const scan = await agent('scan repo', { label: 'scan repo' })
+const scan = await agent('scan repo', { model: 'test/model', label: 'scan repo' })
 return { scan }
 `;
   const agent = {
@@ -246,8 +250,8 @@ test("runWorkflowScriptWithDisplay marks running agents skipped when aborted", a
   };
   const meta = { name: "abort_display", description: "Abort display" };
   const script = `export const meta = { name: 'abort_display', description: 'Abort display' }
-const first = agent('first', { label: 'first' })
-const second = agent('second', { label: 'second' })
+const first = agent('first', { model: 'test/model', label: 'first' })
+const second = agent('second', { model: 'test/model', label: 'second' })
 return await Promise.all([first, second])
 `;
 
@@ -315,50 +319,6 @@ test("createWorkflowTool auto-approval records auto review metadata before runni
   }
 });
 
-test("runWorkflowScriptWithDisplay enforces token budget using real usage metadata", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "workflow-budget-"));
-  let calls = 0;
-  const agent = {
-    async run(prompt: string, options: any): Promise<string> {
-      calls++;
-      options.onMetadata?.({
-        cwd,
-        usage: {
-          input: 6,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          total: 6,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        },
-      });
-      return prompt;
-    },
-  };
-  const meta = { name: "budget_demo", description: "Budget demo" };
-  const script = `export const meta = { name: 'budget_demo', description: 'Budget demo' }
-const first = await agent('first', { label: 'first' })
-const second = await agent('second', { label: 'second' })
-return { first, second }
-`;
-
-  try {
-    await assert.rejects(
-      () =>
-        runWorkflowScriptWithDisplay(script, meta, {
-          cwd,
-          agent,
-          tokenBudget: 5,
-          ctx: { hasUI: false },
-        }),
-      /workflow token budget exhausted/,
-    );
-    assert.equal(calls, 1);
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
-
 test("prepareWorkflowReview writes collision-safe artifact filenames", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "workflow-collision-"));
   const now = new Date("2026-06-22T23:59:58.123Z");
@@ -374,6 +334,441 @@ test("prepareWorkflowReview writes collision-safe artifact filenames", async () 
     assert.match(second.path, /20260622T235958123Z-collision_demo-[a-f0-9]{8}\.workflow\.js$/);
     assert.equal(await readFile(first.path, "utf8"), first.script);
     assert.equal(await readFile(second.path, "utf8"), second.script);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool appends interrupted event when execution throws", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-interrupt-"));
+  const events: WorkflowStateEvent[] = [];
+  const store: WorkflowStateStore = {
+    append(event) {
+      events.push(event);
+    },
+    get(id) {
+      return reduceWorkflowStateEvents(events).get(id);
+    },
+    list() {
+      return [...reduceWorkflowStateEvents(events).values()];
+    },
+  };
+  const agent = {
+    async run(prompt: string, options: any) {
+      options.onMetadata?.({
+        cwd,
+        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: { total: 0 } },
+      });
+      return `done:${prompt}`;
+    },
+  };
+  const tool = createWorkflowTool({ cwd, approvalMode: "auto", stateStore: store, agent: agent as any });
+  const script = `export const meta = { name: 'interrupt_tool', description: 'Interrupt tool' }
+const a = await agent('a', { model: 'test/model', label: 'a' })
+throw new Error('boom')
+return { a }`;
+
+  try {
+    await assert.rejects(
+      () => tool.execute("call-1", { script }, undefined, undefined, { cwd, hasUI: false } as any),
+      /boom/,
+    );
+
+    const created = events.find((event) => event.kind === "created");
+    assert.ok(created);
+    assert.ok(created?.workflowId);
+    const state = store.get(created.workflowId);
+    assert.equal(state?.status, "interrupted");
+    assert.equal(state?.interruption?.reason, "boom");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool appends interrupted event and preserves original hostile error", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-hostile-error-"));
+  const events: WorkflowStateEvent[] = [];
+  const store: WorkflowStateStore = {
+    append(event) {
+      events.push(event);
+    },
+    get(id) {
+      return reduceWorkflowStateEvents(events).get(id);
+    },
+    list() {
+      return [...reduceWorkflowStateEvents(events).values()];
+    },
+  };
+  const agent = {
+    async run(prompt: string, options: any) {
+      options.onMetadata?.({
+        cwd,
+        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: { total: 0 } },
+      });
+      return `done:${prompt}`;
+    },
+  };
+  const tool = createWorkflowTool({ cwd, approvalMode: "auto", stateStore: store, agent: agent as any });
+  const script = `export const meta = { name: 'hostile_error_wf', description: 'Hostile error wf' }
+class HostileError extends Error {
+  get message() { throw new Error('evil getter') }
+}
+const err = new HostileError()
+err.sentinel = true
+const a = await agent('a', { model: 'test/model', label: 'a' })
+throw err
+return { a }`;
+
+  let thrown: unknown;
+  try {
+    await tool.execute("call-1", { script }, undefined, undefined, { cwd, hasUI: false } as any);
+    assert.fail("expected tool.execute to throw");
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof Error, "expected the original error to be rethrown");
+  assert.equal((thrown as { sentinel?: unknown }).sentinel, true, "expected the original hostile error identity");
+
+  const created = events.find((event) => event.kind === "created");
+  assert.ok(created);
+  assert.ok(created?.workflowId);
+  const state = store.get(created.workflowId);
+  assert.equal(state?.status, "interrupted");
+  assert.match(state?.interruption?.reason ?? "", /\[object Error\]/);
+
+  await rm(cwd, { recursive: true, force: true });
+});
+
+test("latest resume filters to paused or interrupted workflows", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-latest-"));
+  const events: WorkflowStateEvent[] = [];
+  const store: WorkflowStateStore = {
+    append(event) {
+      events.push(event);
+    },
+    get(id) {
+      return reduceWorkflowStateEvents(events).get(id);
+    },
+    list() {
+      return [...reduceWorkflowStateEvents(events).values()];
+    },
+  };
+  const tool = createWorkflowTool({ cwd, approvalMode: "auto", stateStore: store });
+  const pauseScript = (name: string) =>
+    `export const meta = { name: '${name}', description: '${name}' }\npause('wait')`;
+  const meta = { name: "latest_filter", description: "Latest filter" };
+
+  try {
+    // Running and completed workflows must be ignored by `latest`.
+    events.push({
+      kind: "created",
+      workflowId: "wf-running",
+      script: "script",
+      meta,
+      timestamp: 1,
+    });
+    events.push({
+      kind: "created",
+      workflowId: "wf-completed",
+      script: "script",
+      meta,
+      timestamp: 2,
+    });
+    events.push({
+      kind: "completed",
+      workflowId: "wf-completed",
+      tokensSpent: 0,
+      timestamp: 3,
+    });
+
+    const paused = await tool.execute("call-paused", { script: pauseScript("paused_wf") }, undefined, undefined, {
+      cwd,
+      hasUI: false,
+    } as any);
+    await tool
+      .execute(
+        "call-interrupted",
+        {
+          script: `export const meta = { name: 'interrupted_wf', description: 'interrupted_wf' }\nthrow new Error('crash')`,
+        },
+        undefined,
+        undefined,
+        { cwd, hasUI: false } as any,
+      )
+      .catch(() => undefined);
+
+    const latest = store
+      .list()
+      .filter((state) => state.status === "paused" || state.status === "interrupted")
+      .sort((a, b) => a.updatedAt - b.updatedAt)
+      .at(-1);
+    assert.equal(latest?.meta.name, "interrupted_wf");
+    assert.equal(latest?.status, "interrupted");
+
+    // Resuming via `latest` should pick the interrupted workflow.
+    const resumed = await tool
+      .execute("call-latest", { resumeId: "latest" }, undefined, undefined, {
+        cwd,
+        hasUI: false,
+      } as any)
+      .catch((error: unknown) => error);
+    assert.ok(resumed instanceof Error, "resuming the interrupted workflow should rethrow its error");
+    assert.match((resumed as Error).message, /crash/);
+
+    const pausedId = (paused.details as any).workflowId as string;
+    assert.notEqual(pausedId, latest?.id);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool resumes across two sequential explicit pauses and then completes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-explicit-pauses-"));
+  const events: WorkflowStateEvent[] = [];
+  const store: WorkflowStateStore = {
+    append(event) {
+      events.push(event);
+    },
+    get(id) {
+      return reduceWorkflowStateEvents(events).get(id);
+    },
+    list() {
+      return [...reduceWorkflowStateEvents(events).values()];
+    },
+  };
+  const calls: string[] = [];
+  const agent = {
+    async run(prompt: string, options: any) {
+      calls.push(prompt);
+      options.onMetadata?.({
+        cwd,
+        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: { total: 0 } },
+      });
+      return `done:${prompt}`;
+    },
+  };
+  const tool = createWorkflowTool({ cwd, approvalMode: "auto", stateStore: store, agent: agent as any });
+  const script = `export const meta = { name: 'two_pauses', description: 'Two pauses' }
+if (!args.resumed) pause('first review')
+if (!args.resumed) pause('second review')
+const a = await agent('a', { model: 'test/model', label: 'a' })
+return { a }`;
+
+  try {
+    const first = await tool.execute("call-1", { script, args: { resumed: false } }, undefined, undefined, {
+      cwd,
+      hasUI: false,
+    } as any);
+    const id = (first.details as any).resumeId as string;
+    assert.match(first.content[0]?.type === "text" ? first.content[0].text : "", /paused/);
+    assert.deepEqual(calls, []);
+    assert.equal(store.get(id)?.pause?.key, first.details.paused?.key);
+
+    const second = await tool.execute("call-2", { resumeId: id }, undefined, undefined, { cwd, hasUI: false } as any);
+    assert.match(second.content[0]?.type === "text" ? second.content[0].text : "", /paused/);
+    assert.notEqual(second.details.paused?.key, first.details.paused?.key);
+    assert.deepEqual(calls, []);
+
+    const final = await tool.execute("call-3", { resumeId: id }, undefined, undefined, { cwd, hasUI: false } as any);
+    assert.match(final.content[0]?.type === "text" ? final.content[0].text : "", /completed/);
+    assert.deepEqual(calls, ["a"]);
+    assert.deepEqual((final.details as any).result, { a: "done:a" });
+    assert.equal(store.get(id)?.status, "completed");
+    assert.deepEqual(store.get(id)?.acknowledgedPauseKeys, [first.details.paused?.key, second.details.paused?.key]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool best-effort appends interrupted when terminal completed persistence fails", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-completed-storage-error-"));
+  const events: WorkflowStateEvent[] = [];
+  const appendedKinds: string[] = [];
+  const storageError = new Error("disk full");
+  const store: WorkflowStateStore = {
+    append(event) {
+      appendedKinds.push(event.kind);
+      // Flaky store: only the terminal 'completed' event fails to persist.
+      if (event.kind === "completed") throw storageError;
+      events.push(event);
+    },
+    get(id) {
+      return reduceWorkflowStateEvents(events).get(id);
+    },
+    list() {
+      return [...reduceWorkflowStateEvents(events).values()];
+    },
+  };
+  const agent = {
+    async run(prompt: string, options: any) {
+      options.onMetadata?.({
+        cwd,
+        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: { total: 0 } },
+      });
+      return `done:${prompt}`;
+    },
+  };
+  const tool = createWorkflowTool({ cwd, approvalMode: "auto", stateStore: store, agent: agent as any });
+  const script = `export const meta = { name: 'completed_storage_error', description: 'Completed storage error' }
+const a = await agent('a', { model: 'test/model', label: 'a' })
+return { a }`;
+
+  try {
+    // The tool must reject with the ORIGINAL storage error, not the interruption.
+    await assert.rejects(
+      () => tool.execute("call-1", { script }, undefined, undefined, { cwd, hasUI: false } as any),
+      /disk full/,
+    );
+
+    // A best-effort 'interrupted' event was still appended so the workflow is
+    // not stuck in 'running' forever and can be resumed.
+    assert.ok(appendedKinds.includes("interrupted"), "expected a best-effort interrupted append");
+    const state = store.list()[0];
+    assert.ok(state);
+    assert.equal(state.status, "interrupted");
+    assert.match(state.interruption?.reason ?? "", /terminal state persistence failed: disk full/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool best-effort appends interrupted when terminal pause persistence fails", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-terminal-storage-error-"));
+  const events: WorkflowStateEvent[] = [];
+  const appendedKinds: string[] = [];
+  const storageError = new Error("disk full");
+  const store: WorkflowStateStore = {
+    append(event) {
+      appendedKinds.push(event.kind);
+      if (event.kind === "paused") throw storageError;
+      events.push(event);
+    },
+    get(id) {
+      return reduceWorkflowStateEvents(events).get(id);
+    },
+    list() {
+      return [...reduceWorkflowStateEvents(events).values()];
+    },
+  };
+  const agent = {
+    async run(prompt: string, options: any) {
+      options.onMetadata?.({
+        cwd,
+        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: { total: 0 } },
+      });
+      return `done:${prompt}`;
+    },
+  };
+  const tool = createWorkflowTool({ cwd, approvalMode: "auto", stateStore: store, agent: agent as any });
+  const script = `export const meta = { name: 'storage_error', description: 'Storage error' }
+await agent('a', { model: 'test/model', label: 'a' })
+pause('checkpoint')`;
+
+  try {
+    await assert.rejects(
+      () => tool.execute("call-1", { script }, undefined, undefined, { cwd, hasUI: false } as any),
+      /disk full/,
+    );
+
+    assert.ok(appendedKinds.includes("interrupted"), "expected a best-effort interrupted append");
+    const state = store.list()[0];
+    assert.ok(state);
+    assert.equal(state.status, "interrupted");
+    assert.match(state.interruption?.reason ?? "", /terminal state persistence failed: disk full/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool surfaces the original error when stateStore.get throws during the catch path", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-get-throw-"));
+  const events: WorkflowStateEvent[] = [];
+  const appendedKinds: string[] = [];
+  const getError = new Error("store get failed");
+  const store: WorkflowStateStore = {
+    append(event) {
+      appendedKinds.push(event.kind);
+      events.push(event);
+    },
+    get() {
+      throw getError;
+    },
+    list() {
+      return [...reduceWorkflowStateEvents(events).values()];
+    },
+  };
+  const agent = {
+    async run(prompt: string, options: any) {
+      options.onMetadata?.({
+        cwd,
+        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: { total: 0 } },
+      });
+      return `done:${prompt}`;
+    },
+  };
+  const tool = createWorkflowTool({ cwd, approvalMode: "auto", stateStore: store, agent: agent as any });
+  const script = `export const meta = { name: 'get_throw', description: 'Store get throws' }
+await agent('a', { model: 'test/model', label: 'a' })
+throw new Error('boom')`;
+
+  try {
+    await assert.rejects(
+      () => tool.execute("call-1", { script }, undefined, undefined, { cwd, hasUI: false } as any),
+      /boom/,
+    );
+
+    assert.ok(appendedKinds.includes("interrupted"), "expected a best-effort interrupted append");
+    const state = store.list()[0];
+    assert.ok(state);
+    assert.equal(state.status, "interrupted");
+    assert.equal(state.interruption?.reason, "boom");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool executes sequentially to avoid sibling resume races", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workflow-seq-"));
+  const events: WorkflowStateEvent[] = [];
+  const store: WorkflowStateStore = {
+    append(event) {
+      events.push(event);
+    },
+    get(id) {
+      return reduceWorkflowStateEvents(events).get(id);
+    },
+    list() {
+      return [...reduceWorkflowStateEvents(events).values()];
+    },
+  };
+  let running = 0;
+  let maxRunning = 0;
+  const agent = {
+    async run(prompt: string, options: any) {
+      running++;
+      maxRunning = Math.max(maxRunning, running);
+      await delay(20);
+      options.onMetadata?.({
+        cwd,
+        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: { total: 0 } },
+      });
+      running--;
+      return `done:${prompt}`;
+    },
+  };
+  const tool = createWorkflowTool({ cwd, approvalMode: "auto", stateStore: store, agent: agent as any });
+  const script = `export const meta = { name: 'seq', description: 'Sequential' }
+await agent('x', { model: 'test/model', label: 'x' })
+return { ok: true }`;
+
+  try {
+    const [a, b] = await Promise.all([
+      tool.execute("call-1", { script }, undefined, undefined, { cwd, hasUI: false } as any),
+      tool.execute("call-2", { script }, undefined, undefined, { cwd, hasUI: false } as any),
+    ]);
+    assert.ok(a);
+    assert.ok(b);
+    assert.equal(maxRunning, 1, `expected sequential execution, but ${maxRunning} agents ran concurrently`);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

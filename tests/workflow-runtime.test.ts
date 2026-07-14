@@ -17,7 +17,7 @@ test("runWorkflow accepts metadata without phases and records runtime phases", a
 }
 
 phase('Scan')
-const scan = await agent('scan', { label: 'scan' })
+const scan = await agent('scan', { model: 'test/model', label: 'scan' })
 return { scan }
 `,
     { agent: fakeAgent },
@@ -38,12 +38,12 @@ test("runWorkflow records loop-created phases without skipped conditional phases
 
 if (args.needsReview) {
   phase('Review')
-  await agent('review', { label: 'review' })
+  await agent('review', { model: 'test/model', label: 'review' })
 }
 
 for (const area of args.areas) {
   phase('Inspect ' + area)
-  await agent('inspect ' + area, { label: 'inspect ' + area })
+  await agent('inspect ' + area, { model: 'test/model', label: 'inspect ' + area })
 }
 
 return { ok: true }
@@ -70,7 +70,7 @@ test("runWorkflow rejects unawaited nested agent promises before returning detai
 }
 
 phase('Leak promise')
-const scan = agent('scan', { label: 'scan' })
+const scan = agent('scan', { model: 'test/model', label: 'scan' })
 return { scan }
 `,
         {
@@ -112,7 +112,7 @@ test("runWorkflow allows prompts that mention nondeterministic API names", async
 }
 
 phase('Catalog mentions')
-const scan = await agent('Catalog Date.now(), Math.random(), and new Date() usage', { label: 'scan' })
+const scan = await agent('Catalog Date.now(), Math.random(), and new Date() usage', { model: 'test/model', label: 'scan' })
 return { scan }
 `,
     { agent: fakeAgent },
@@ -135,7 +135,7 @@ const now = Date.now()
 const date = new Date(now)
 const random = Math.random()
 const rounded = Math.floor(random * 10)
-const scan = await agent('scan at ' + date.getUTCFullYear(), { label: 'scan' })
+const scan = await agent('scan at ' + date.getUTCFullYear(), { model: 'test/model', label: 'scan' })
 return { nowType: typeof now, date: date instanceof Date, randomType: typeof random, rounded, scan }
 `,
     { agent: fakeAgent },
@@ -145,6 +145,29 @@ return { nowType: typeof now, date: date instanceof Date, randomType: typeof ran
   assert.equal((result.result as { date: boolean }).date, true);
   assert.equal((result.result as { randomType: string }).randomType, "number");
   assert.equal((result.result as { scan: string }).scan.startsWith("result:scan at "), true);
+});
+
+test("runWorkflow forwards deterministic model-routing job hints", async () => {
+  let received: any;
+  const result = await runWorkflow(
+    `export const meta = { name: 'job_hint', description: 'Route by job' }
+const output = await agent('inspect', {
+  label: 'routed inspection',
+  job: 'inspection',
+})
+return { output }`,
+    {
+      agent: {
+        async run(_prompt: string, options: any) {
+          received = options.job;
+          return "ok";
+        },
+      } as any,
+    },
+  );
+
+  assert.equal((result.result as any).output, "ok");
+  assert.equal(received, "inspection");
 });
 
 test("runWorkflow forwards model, thinkingLevel, isolation, and metadata", async () => {
@@ -251,7 +274,7 @@ test("runWorkflow rejects promise-vs-thunk misuse of parallel", async () => {
   description: 'Pass promises to parallel instead of thunks'
 }
 
-await parallel([agent('scan', { label: 'scan' })])
+await parallel([agent('scan', { model: 'test/model', label: 'scan' })])
 return { ok: true }
 `,
         { agent: fakeAgent },
@@ -275,7 +298,7 @@ const values = await pipeline(
   },
   (value) => value + 1,
 )
-const sink = await agent('sink', { label: 'sink' })
+const sink = await agent('sink', { model: 'test/model', label: 'sink' })
 return { values, sink }
 `,
     { agent: fakeAgent },
@@ -301,7 +324,7 @@ test("runWorkflow records structured agent errors and returns null branches", as
   description: 'Record failed agent branches'
 }
 
-const value = await agent('fail please', { label: 'broken' })
+const value = await agent('fail please', { model: 'test/model', label: 'broken' })
 return { value }
 `,
     { agent },
@@ -334,7 +357,7 @@ test("runWorkflow rethrows AbortError from agent runners", async () => {
   description: 'Rethrow aborts'
 }
 
-return await agent('abort', { label: 'abort' })
+return await agent('abort', { model: 'test/model', label: 'abort' })
 `,
         { agent },
       ),
@@ -356,7 +379,7 @@ test("runWorkflow preserves parallel result order under low concurrency", async 
   description: 'Keep input order'
 }
 
-const results = await parallel(['a', 'b', 'c'].map((item) => () => agent(item, { label: item })))
+const results = await parallel(['a', 'b', 'c'].map((item) => () => agent(item, { model: 'test/model', label: item })))
 return results
 `,
     { agent, concurrency: 2 },
@@ -385,7 +408,7 @@ test("runWorkflow limiter never exceeds the configured concurrency under races",
 }
 
 const items = Array.from({ length: 25 }, (_, index) => index)
-const results = await parallel(items.map((index) => () => agent('task ' + index, { label: 'task ' + index })))
+const results = await parallel(items.map((index) => () => agent('task ' + index, { model: 'test/model', label: 'task ' + index })))
 return { count: results.length }
 `,
     { agent, concurrency: 3 },
@@ -411,7 +434,7 @@ test("runWorkflow awaits unawaited agent calls at script return and logs a warni
   description: 'Await unawaited agents after return'
 }
 
-agent('background', { label: 'background' })
+agent('background', { model: 'test/model', label: 'background' })
 return { ok: true }
 `,
     {
@@ -437,7 +460,7 @@ test("runWorkflow rejects BigInt workflow results as non-JSON-serializable", asy
   description: 'Reject bigint result'
 }
 
-await agent('x', { label: 'x' })
+await agent('x', { model: 'test/model', label: 'x' })
 return { value: 1n }
 `,
         { agent: fakeAgent },
@@ -455,7 +478,7 @@ test("runWorkflow rejects cyclic workflow results as non-JSON-serializable", asy
   description: 'Reject cyclic result'
 }
 
-await agent('x', { label: 'x' })
+await agent('x', { model: 'test/model', label: 'x' })
 const value = { ok: true }
 value.self = value
 return value
@@ -464,4 +487,425 @@ return value
       ),
     /workflow result must be JSON-serializable; JSON\.stringify failed.*circular/i,
   );
+});
+
+test("explicit pause returns cooperative pause data without running agents", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'manual_pause', description: 'Pause safely' }
+pause('Await user review', { checkpoint: 'design' })`,
+    { agent: fakeAgent },
+  );
+
+  assert.equal(result.paused?.reason, "Await user review");
+  assert.deepEqual(result.paused?.data, { checkpoint: "design" });
+  assert.ok(result.paused?.key, "explicit pause must have a deterministic key");
+  assert.equal(result.agentCount, 0);
+  assert.equal(result.result, null);
+});
+
+test("workflow agent labels must be unique for unambiguous replay", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'duplicate_labels', description: 'Reject ambiguous checkpoints' }
+await agent('one', { model: 'test/model', label: 'same' })
+await agent('two', { model: 'test/model', label: 'same' })
+return { ok: true }`,
+        { agent: fakeAgent },
+      ),
+    /Duplicate workflow agent label "same"/,
+  );
+});
+
+test("own-key labels like __proto__, constructor, and toString are safe", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'own_key_labels', description: 'Own-key labels' }
+const a = await agent('a', { model: 'test/model', label: '__proto__' })
+const b = await agent('b', { model: 'test/model', label: 'constructor' })
+const c = await agent('c', { model: 'test/model', label: 'toString' })
+return { a, b, c }
+`,
+    { agent: fakeAgent },
+  );
+
+  assert.deepEqual(result.result, { a: "result:a", b: "result:b", c: "result:c" });
+  assert.deepEqual(
+    result.agents.map((agent) => agent.label),
+    ["__proto__", "constructor", "toString"],
+  );
+});
+
+test("duplicate labels fail reliably inside parallel", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'parallel_dup', description: 'Parallel duplicate labels' }
+await parallel([
+  () => agent('first', { model: 'test/model', label: 'shared' }),
+  () => agent('second', { model: 'test/model', label: 'shared' }),
+])
+return { ok: true }`,
+        { agent: fakeAgent, concurrency: 2 },
+      ),
+    /Duplicate workflow agent label "shared"/,
+  );
+});
+
+test("checkpoint replay rejects legacy checkpoints missing a fingerprint", async () => {
+  const checkpoints: any[] = [];
+  const script = `export const meta = { name: 'legacy_reject', description: 'Reject legacy checkpoint' }
+const first = await agent('first task', { model: 'test/model', label: 'first' })
+return { first }`;
+
+  await runWorkflow(script, {
+    agent: fakeAgent,
+    async onAgentCheckpoint(checkpoint, tokensSpent) {
+      checkpoints.push({ checkpoint, tokensSpent });
+    },
+  });
+
+  const legacy = {
+    model: "test/model",
+    label: checkpoints[0].checkpoint.label,
+    result: checkpoints[0].checkpoint.result,
+  };
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: fakeAgent,
+        resume: { workflowId: "legacy-1", tokensSpent: 0, completed: { first: legacy } },
+      }),
+    /checkpoint is missing a fingerprint/,
+  );
+});
+
+test("checkpoint replay rejects fingerprint mismatches", async () => {
+  const checkpoints: any[] = [];
+  const script = `export const meta = { name: 'fp_mismatch', description: 'Fingerprint mismatch' }
+const first = await agent('first task', { model: 'test/model', label: 'first' })
+return { first }`;
+
+  await runWorkflow(script, {
+    agent: fakeAgent,
+    async onAgentCheckpoint(checkpoint, tokensSpent) {
+      checkpoints.push({ checkpoint, tokensSpent });
+    },
+  });
+
+  const tampered = { ...checkpoints[0].checkpoint, fingerprint: "deadbeef" };
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: fakeAgent,
+        resume: { workflowId: "fp-1", tokensSpent: 0, completed: { first: tampered } },
+      }),
+    /fingerprint mismatch/,
+  );
+});
+
+test("fingerprint mismatches propagate through parallel instead of becoming null branches", async () => {
+  const script = `export const meta = { name: 'parallel_fp_mismatch', description: 'Parallel fingerprint mismatch' }
+const results = await parallel([() => agent('first task', { model: 'test/model', label: 'first' })])
+return results`;
+
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: fakeAgent,
+        resume: {
+          workflowId: "parallel-fp-1",
+          tokensSpent: 0,
+          completed: { first: { model: "test/model", label: "first", result: "stale", fingerprint: "deadbeef" } },
+        },
+      }),
+    /fingerprint mismatch/,
+  );
+});
+
+test("explicit pause resumes past an already-recorded pause", async () => {
+  const script = `export const meta = { name: 'explicit_resume', description: 'Resume past pause' }
+pause('Await review', { stage: 'design' })
+const first = await agent('first task', { model: 'test/model', label: 'first' })
+return { first }`;
+
+  const first = await runWorkflow(script, { agent: fakeAgent });
+  assert.equal(first.paused?.reason, "Await review");
+  assert.ok(first.paused?.key);
+  const pauseKey = first.paused?.key;
+  assert.ok(pauseKey);
+
+  const resumed = await runWorkflow(script, {
+    agent: fakeAgent,
+    resume: {
+      workflowId: "explicit-resume-1",
+      tokensSpent: 0,
+      completed: {},
+      acknowledgedPauseKeys: [pauseKey],
+    },
+  });
+
+  assert.equal(resumed.paused, undefined);
+  assert.deepEqual(resumed.result, { first: "result:first task" });
+});
+
+test("checkpoint persistence errors propagate as infrastructure errors", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'persist_fail', description: 'Persist fails' }
+const first = await agent('first', { model: 'test/model', label: 'first' })
+return { first }`,
+        {
+          agent: fakeAgent,
+          async onAgentCheckpoint() {
+            throw new Error("persistent store unreachable");
+          },
+        },
+      ),
+    /persistent store unreachable/,
+  );
+});
+
+test("checkpoint persistence errors propagate through parallel instead of becoming null branches", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'parallel_persist_fail', description: 'Parallel persistence failure' }
+const results = await parallel([() => agent('first', { model: 'test/model', label: 'first' })])
+return results`,
+        {
+          agent: fakeAgent,
+          async onAgentCheckpoint() {
+            throw new Error("parallel store unreachable");
+          },
+        },
+      ),
+    /parallel store unreachable/,
+  );
+});
+
+test("unawaited checkpoint persistence error is propagated after script returns", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'unawaited_ckpt', description: 'Unawaited checkpoint' }
+agent('background', { model: 'test/model', label: 'background' })
+return { ok: true }`,
+        {
+          agent: fakeAgent,
+          async onAgentCheckpoint() {
+            throw new Error("checkpoint persistence failed");
+          },
+        },
+      ),
+    /checkpoint persistence failed/,
+  );
+  // Give the unawaited agent promise's rejection handler time to run so
+  // node:test does not report it as post-test asynchronous activity.
+  await delay(10);
+});
+
+test("unawaited fingerprint mismatch pause signal is propagated after script returns", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'unawaited_fp', description: 'Unawaited fingerprint' }
+agent('background', { model: 'test/model', label: 'background' })
+return { ok: true }`,
+        {
+          agent: fakeAgent,
+          resume: {
+            workflowId: "unawaited-fp-1",
+            tokensSpent: 0,
+            completed: {
+              background: {
+                label: "background",
+                result: "stale",
+                fingerprint: "deadbeef",
+              },
+            },
+          },
+        },
+      ),
+    /fingerprint mismatch/,
+  );
+  await delay(10);
+});
+
+test("agent requires an explicit model or known job work type synchronously", async () => {
+  const missing = `export const meta = { name: 'missing_model', description: 'Missing model' }
+return await agent('inspect', { label: 'inspect' })`;
+  await assert.rejects(
+    runWorkflow(missing),
+    /agent "inspect" must specify an explicit model or a job work type \(one of: architecture, classification, exploration, implementation, inspection, judge, planning, research, review, security-review, summarization, synthesis\)/,
+  );
+
+  const unknown = `export const meta = { name: 'unknown_job', description: 'Unknown job' }
+return await agent('inspect', { label: 'inspect', job: 'nope' })`;
+  await assert.rejects(
+    runWorkflow(unknown),
+    /Unknown workflow job type "nope"\. Known types: architecture, classification, exploration, implementation, inspection, judge, planning, research, review, security-review, summarization, synthesis/,
+  );
+});
+
+test("agent without model or job inside parallel rejects the whole workflow", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'parallel_missing_model', description: 'Missing model in parallel' }
+await parallel([() => agent('inspect', { label: 'inspect' })])
+return { ok: true }`,
+        { agent: fakeAgent },
+      ),
+    /agent "inspect" must specify an explicit model or a job work type/,
+  );
+});
+
+test("unknown job inside pipeline rejects the whole workflow", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'pipeline_unknown_job', description: 'Unknown job in pipeline' }
+await pipeline([1], () => agent('inspect', { label: 'inspect', job: 'nope' }))
+return { ok: true }`,
+        { agent: fakeAgent },
+      ),
+    /Unknown workflow job type "nope"/,
+  );
+});
+
+test("agent with an explicit model but an unknown job type rejects the workflow", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'model_unknown_job', description: 'Model plus unknown job' }
+return await agent('inspect', { model: 'test/model', label: 'inspect', job: 'nope' })`,
+        { agent: fakeAgent },
+      ),
+    /Unknown workflow job type "nope"/,
+  );
+});
+
+test("prototype-key job types like toString are rejected as unknown jobs", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'proto_job', description: 'Prototype job' }
+return await agent('inspect', { label: 'inspect', job: 'toString' })`,
+        { agent: fakeAgent },
+      ),
+    /Unknown workflow job type "toString"/,
+  );
+});
+
+test("changing an agent's job string across resume invalidates the checkpoint fingerprint", async () => {
+  const checkpoints: any[] = [];
+  const script = (job: string) =>
+    `export const meta = { name: 'job_fp', description: 'Job fingerprint' }
+const first = await agent('first task', { model: 'test/model', label: 'first', job: '${job}' })
+return { first }`;
+
+  await runWorkflow(script("inspection"), {
+    agent: fakeAgent,
+    async onAgentCheckpoint(checkpoint, tokensSpent) {
+      checkpoints.push({ checkpoint, tokensSpent });
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      runWorkflow(script("research"), {
+        agent: fakeAgent,
+        resume: {
+          workflowId: "job-fp-1",
+          tokensSpent: 0,
+          completed: { first: checkpoints[0].checkpoint },
+        },
+      }),
+    /fingerprint mismatch/,
+  );
+});
+
+test("content-identical pause resumes across three cycles using occurrence keys", async () => {
+  const script = `export const meta = { name: 'triple_pause', description: 'Repeated identical pause' }
+pause('same review', { stage: 'x' })
+pause('same review', { stage: 'x' })
+const first = await agent('first task', { model: 'test/model', label: 'first' })
+return { first }`;
+
+  // Cycle 1: run -> pause at occurrence 1 (key K1).
+  const first = await runWorkflow(script, { agent: fakeAgent });
+  assert.equal(first.paused?.reason, "same review");
+  const k1 = first.paused?.key ?? "";
+  assert.match(k1, /^pause-[a-f0-9]{16}-1$/);
+
+  // Cycle 2: resume acknowledging K1 -> pause again at occurrence 2 (key K2 != K1).
+  const second = await runWorkflow(script, {
+    agent: fakeAgent,
+    resume: {
+      workflowId: "triple-pause-1",
+      tokensSpent: 0,
+      completed: {},
+      acknowledgedPauseKeys: [k1],
+    },
+  });
+  assert.equal(second.paused?.reason, "same review");
+  const k2 = second.paused?.key ?? "";
+  assert.match(k2, /^pause-[a-f0-9]{16}-2$/);
+  assert.notEqual(k1, k2);
+
+  // Cycle 3: resume acknowledging K1 + K2 -> completes past both pauses.
+  const third = await runWorkflow(script, {
+    agent: fakeAgent,
+    resume: {
+      workflowId: "triple-pause-1",
+      tokensSpent: 0,
+      completed: {},
+      acknowledgedPauseKeys: [k1, k2],
+    },
+  });
+  assert.equal(third.paused, undefined);
+  assert.deepEqual(third.result, { first: "result:first task" });
+});
+
+test("identical explicit pauses use occurrence keys and resume skips only the acknowledged occurrence", async () => {
+  const script = `export const meta = { name: 'repeat_pause', description: 'Repeated pause' }
+pause('same', { value: 1 })
+pause('same', { value: 1 })`;
+  const first = await runWorkflow(script);
+  assert.match(first.paused?.key ?? "", /^pause-[a-f0-9]{16}-1$/);
+  const second = await runWorkflow(script, {
+    resume: {
+      workflowId: "repeat",
+      tokensSpent: 0,
+      completed: {},
+      acknowledgedPauseKeys: [first.paused?.key ?? ""],
+    },
+  });
+  assert.equal(second.paused?.reason, "same");
+  assert.match(second.paused?.key ?? "", /^pause-[a-f0-9]{16}-2$/);
+  assert.notEqual(first.paused?.key, second.paused?.key);
+});
+
+test("parallel distinct pauses retain content keys when branch timing reverses", async () => {
+  const script = (
+    leftDelay: number,
+    rightDelay: number,
+  ) => `export const meta = { name: 'parallel_pause', description: 'Parallel pauses' }
+await parallel([
+  async () => { await new Promise(resolve => setTimeout(resolve, ${leftDelay})); pause('left', { branch: 'left' }) },
+  async () => { await new Promise(resolve => setTimeout(resolve, ${rightDelay})); pause('right', { branch: 'right' }) },
+])`;
+  const first = await runWorkflow(script(0, 10));
+  assert.equal(first.paused?.reason, "left");
+  const resumed = await runWorkflow(script(10, 0), {
+    resume: {
+      workflowId: "parallel",
+      tokensSpent: 0,
+      completed: {},
+      acknowledgedPauseKeys: [first.paused?.key ?? ""],
+    },
+  });
+  assert.equal(resumed.paused?.reason, "right");
+  assert.match(resumed.paused?.key ?? "", /^pause-[a-f0-9]{16}-1$/);
 });

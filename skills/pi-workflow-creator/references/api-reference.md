@@ -12,7 +12,7 @@ package, not another workflow runtime.
 4. Runtime globals
 5. `agent()` options
 6. `parallel()` and `pipeline()`
-7. `args`, `cwd`, and `budget`
+7. `args` and `cwd`
 8. Trust, isolation, and practical limits
 
 ## 1. Workflow fit
@@ -41,9 +41,9 @@ The Pi tool accepts an object with:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `script` | string | Required raw JavaScript. Do not wrap in Markdown fences. |
+| `script` | string | Raw JavaScript for a new workflow. Mutually exclusive with `resumeId`. |
 | `args` | any | Optional value exposed as global `args` in the script. |
-| `tokenBudget` | number or null | Optional total token budget exposed as `budget.total`; `null` (or omitted) means unlimited. |
+| `resumeId` | string | Resume a paused/interrupted workflow from the active Pi session branch; `latest` selects the newest. |
 
 Interactive sessions write the script to a review file before execution:
 
@@ -89,15 +89,15 @@ Rules:
 
 | Global | Purpose |
 | --- | --- |
-| `agent(prompt, opts?)` | Run one fresh-context Pi subagent. |
+| `agent(prompt, opts)` | Run one fresh-context Pi subagent. `opts` is required and must include `model` or `job`. |
 | `parallel(thunks)` | Run an array of `() => Promise` tasks concurrently, then wait for all. |
 | `pipeline(items, ...stages)` | Run each item through ordered stages while different items overlap. |
 | `phase(title)` | Mark the current progress group. |
+| `pause(reason, data?)` | Persist a cooperative pause; resume replays and reuses completed labeled agents. |
 | `log(message)` | Add a workflow-level log line. |
 | `args` | Optional value passed through from tool input. |
 | `cwd` | Current working directory for the workflow. |
 | `process.cwd()` | Safe cwd shim. |
-| `budget` | `{ total, spent(), remaining() }` token budget helper. |
 | `console` | Routed to workflow logs. |
 
 The orchestrator should coordinate. Put repository reads, shell commands, file
@@ -113,7 +113,7 @@ view from the parent orchestrator.
 Wrong:
 
 ```js
-agent("Review the code above for race conditions.", { label: "review" });
+agent("Review the code above for race conditions.", { label: "review", job: "review" });
 ```
 
 Right:
@@ -124,7 +124,7 @@ agent(
     "File: src/queue.js\n" +
     "Code:\n```js\n...\n```\n" +
     "Known concern: enqueue and dequeue both mutate `tail` without locking.",
-  { label: "review" },
+  { label: "review", job: "review" },
 );
 ```
 
@@ -152,7 +152,8 @@ const result = await agent("Inspect src/auth for security issues.", {
 | `label` | string | Use a unique 2-5 word label for readable progress. |
 | `phase` | string | Assign an agent to a progress group, especially inside concurrent callbacks. |
 | `schema` | JSON Schema | Use whenever JavaScript reads fields from the result. |
-| `model` | string or `{ provider, id }` | Prefer exact provider/id refs. See `model-selection.md`. |
+| `model` | string or `{ provider, id }` | Prefer exact provider/id refs. Explicit model overrides job routing. Required unless `job` is given. See `model-selection.md`. |
+| `job` | string | Required unless `model` is given. A v2 work-type string for deterministic catalog routing. Bundled types: `inspection`, `classification`, `research`, `summarization`, `implementation`, `exploration`, `synthesis`, `planning`, `review`, `security-review`, `judge`, `architecture`. Unknown types are a runtime error. |
 | `thinkingLevel` | string | One of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. |
 | `isolation` | string or object | Use worktree isolation for project inspection or parallel mutation. |
 | `agentType` | string | Free-text role hint. It does not select a registered agent implementation; it only appends `Act as workflow subagent type: <agentType>` to the subagent instructions. |
@@ -180,6 +181,7 @@ const reports = await parallel(
     agent(`Inspect ${area.path}`, {
       label: area.label,
       phase: "Inspect",
+      job: "inspection",
     }),
   ),
 );
@@ -189,7 +191,7 @@ Do not pass already-created promises:
 
 ```js
 // Wrong: agent() starts immediately and parallel() receives promises.
-await parallel(areas.map((area) => agent(`Inspect ${area.path}`)));
+await parallel(areas.map((area) => agent(`Inspect ${area.path}`, { job: "inspection" })));
 ```
 
 Use `parallel()` as a barrier only when the next step needs all results at once:
@@ -204,6 +206,7 @@ const verified = await pipeline(
     agent(dimension.prompt, {
       label: `review:${dimension.key}`,
       phase: "Review",
+      job: "review",
       schema: FINDINGS,
     }),
   (review, dimension) =>
@@ -212,6 +215,7 @@ const verified = await pipeline(
         agent(`Try to refute this finding:\n${JSON.stringify(finding)}`, {
           label: `verify:${dimension.key}`,
           phase: "Verify",
+          job: "review",
           schema: VERDICT,
         }),
       ),
@@ -241,11 +245,11 @@ const summary = {
 };
 const next = await agent(
   `Triage these findings.\n\n${JSON.stringify(summary, null, 2)}`,
-  { label: "triage", schema: TRIAGE },
+  { label: "triage", job: "synthesis", schema: TRIAGE },
 );
 ```
 
-## 7. `args`, `cwd`, And `budget`
+## 7. `args` And `cwd`
 
 Pi passes `args` through as supplied to the tool. Parse only if the caller passed
 a string:
@@ -266,25 +270,42 @@ const input =
 Use `cwd` or `process.cwd()` only to tell subagents where they are operating.
 The parent workflow should not attempt direct filesystem work.
 
-`budget.total` is the token target passed through the workflow tool's
-`tokenBudget` input (non-null when the caller provides one) and `null` when no
-target is set. `budget.spent()` accumulates real subagent token usage as agents
-report it, and `budget.remaining()` returns `Infinity` when `total` is `null`.
-When a budget is set and it is exhausted, the next `agent()` call throws
-`workflow token budget exhausted`, so always pair a budget with an explicit
-hard stop. Guard budget-scaled loops:
+Progress is persisted as Pi session custom entries. Resume by calling the
+workflow tool with `resumeId` (or `"latest"`). The script replays from the
+beginning and completed uniquely-labeled agents are reused from checkpoints.
+Each checkpoint carries a deterministic fingerprint over the replay-relevant
+invocation (prompt, phase, label, schema, model/job, thinking level, isolation,
+agent type); changing any of these invalidates the checkpoint and causes resume
+to fail clearly rather than reuse stale work.
+
+Always include a hard stop: a target count, maximum rounds, or dry-streak limit.
+Use a bounded-rounds + dry-streak loop:
 
 ```js
-while (budget.total && budget.remaining() > 50_000 && found.length < 100) {
-  const result = await agent("Find more issues not already listed.", {
+const found = [];
+let rounds = 0;
+let dryStreak = 0;
+while (found.length < 25 && rounds < 8 && dryStreak < 2) {
+  rounds += 1;
+  const before = found.length;
+  const result = await agent("Find one more high-signal issue not already listed.", {
+    label: `round:${rounds}`,
+    model: "opencode-go/deepseek-v4-flash",
     schema: ISSUE_BATCH,
   });
   found.push(...(result?.issues ?? []));
+  dryStreak = found.length === before ? dryStreak + 1 : 0;
+  log(`${found.length} found after ${rounds} round(s)`);
 }
 ```
 
-Always include a hard stop: a target count, maximum rounds, dry-streak limit, or
-budget guard.
+Explicit `pause(reason, data?)` creates a deterministic pause key (hash of
+reason + data plus an occurrence counter), so acknowledged pauses are skipped on
+replay. Resuming an interrupted workflow replays from the last saved checkpoint
+and reuses completed labeled agents. Code outside `agent()` runs again, so keep
+it deterministic and side effects idempotent. If a workflow aborts or throws
+after it is created or resumed, the tool records an `interrupted` state event
+before rethrowing.
 
 ## 8. Trust, Isolation, And Practical Limits
 
