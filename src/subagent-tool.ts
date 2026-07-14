@@ -117,6 +117,8 @@ export interface SubagentToolOptions {
   reviewDir?: string;
   /** Injectable agent runner (tests). Defaults to a real WorkflowAgent. */
   agent?: RunWorkflowScriptOptions["agent"];
+  runner?: RunWorkflowScriptOptions["runner"];
+  piRust?: RunWorkflowScriptOptions["piRust"];
 }
 
 /**
@@ -279,6 +281,8 @@ export function createSubagentTool(options: SubagentToolOptions = {}): ToolDefin
         signal,
         review,
         agent: options.agent,
+        runner: options.runner,
+        piRust: options.piRust,
         displayOptions: defaultWorkflowDisplayOptions("subagent"),
         onUpdate,
         ctx,

@@ -44,6 +44,8 @@ export type {
   WorkflowWorktreeMetadata,
   WorktreeIsolation,
 } from "./options.js";
+export type { PiRustAgentOptions } from "./pi-rust-agent.js";
+export { isPiRustAvailable, PiRustWorkflowAgent } from "./pi-rust-agent.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
 export type {
@@ -75,7 +77,9 @@ export type {
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowPauseInfo,
+  WorkflowPiRustRunnerOptions,
   WorkflowResumeState,
+  WorkflowRunnerKind,
   WorkflowRunOptions,
   WorkflowRunResult,
 } from "./workflow.js";

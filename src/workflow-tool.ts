@@ -85,6 +85,8 @@ export interface RunWorkflowScriptOptions {
   args?: unknown;
   concurrency?: number;
   modelCatalog?: WorkflowModelCatalog;
+  runner?: WorkflowRunOptions["runner"];
+  piRust?: WorkflowRunOptions["piRust"];
   resume?: WorkflowRunOptions["resume"];
   onAgentCheckpoint?: WorkflowRunOptions["onAgentCheckpoint"];
   signal?: AbortSignal;
@@ -136,6 +138,8 @@ export async function runWorkflowScriptWithDisplay(
       agent: options.agent,
       concurrency: options.concurrency,
       modelCatalog: options.modelCatalog,
+      runner: options.runner,
+      piRust: options.piRust,
       resume: options.resume,
       onAgentCheckpoint: options.onAgentCheckpoint,
       session: {
@@ -249,6 +253,8 @@ export interface WorkflowToolOptions {
   stateStore?: WorkflowStateStore;
   /** Injectable agent runner for tests and embedded runtimes. */
   agent?: RunWorkflowScriptOptions["agent"];
+  runner?: WorkflowRunOptions["runner"];
+  piRust?: WorkflowRunOptions["piRust"];
   /** Override the bundled deterministic job-to-model routing catalog. */
   modelCatalog?: WorkflowModelCatalog;
   approvalMode?: WorkflowApprovalMode;
@@ -417,6 +423,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
             args: runArgs,
             concurrency: options.concurrency,
             agent: options.agent,
+            runner: options.runner,
+            piRust: options.piRust,
             modelCatalog: options.modelCatalog,
             resume: saved
               ? {

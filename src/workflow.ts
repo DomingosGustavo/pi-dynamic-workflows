@@ -10,6 +10,7 @@ import type {
   WorkflowThinkingLevel,
   WorktreeIsolation,
 } from "./options.js";
+import { type PiRustAgentOptions, PiRustWorkflowAgent } from "./pi-rust-agent.js";
 import type { WorkflowCompletedCheckpoint } from "./workflow-state.js";
 import { normalizeWorktreeIsolation } from "./worktree.js";
 
@@ -63,9 +64,18 @@ export interface WorkflowAgentRunRecord {
   error?: WorkflowSerializedError;
 }
 
+export type WorkflowRunnerKind = "in-process" | "pi-rust";
+
+export interface WorkflowPiRustRunnerOptions {
+  binary?: PiRustAgentOptions["binary"];
+  extraCliArgs?: PiRustAgentOptions["extraCliArgs"];
+}
+
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   agent?: Pick<WorkflowAgent, "run">;
+  runner?: WorkflowRunnerKind;
+  piRust?: WorkflowPiRustRunnerOptions;
   concurrency?: number;
   resume?: WorkflowResumeState;
   onAgentCheckpoint?: (checkpoint: WorkflowCompletedCheckpoint, tokensSpent: number) => void | Promise<void>;
@@ -148,7 +158,11 @@ export async function runWorkflow<T = unknown>(
     spent: options.resume?.tokensSpent ?? 0,
     agents: [],
   };
-  const agentRunner = options.agent ?? new WorkflowAgent(options);
+  const agentRunner =
+    options.agent ??
+    (options.runner === "pi-rust"
+      ? new PiRustWorkflowAgent({ ...options, ...options.piRust })
+      : new WorkflowAgent(options));
   const concurrency = Math.max(
     1,
     Math.min(options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2), 16),

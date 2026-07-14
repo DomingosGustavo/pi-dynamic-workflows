@@ -4,6 +4,7 @@ import {
   createSubagentTool,
   createWorkflowTool,
   DELEGATION_PROMPT_MARKER,
+  isPiRustAvailable,
   isWorkflowStateEvent,
   type PersistedWorkflowState,
   pruneStale,
@@ -43,8 +44,14 @@ export default function extension(pi: ExtensionAPI) {
     states = reduceWorkflowStateEvents(stateEvents);
   };
 
-  const workflowTool = createWorkflowTool({ stateStore });
-  const subagentTool = createSubagentTool();
+  const runner: "in-process" | "pi-rust" =
+    process.env.PI_WORKFLOW_RUNNER === "in-process"
+      ? "in-process"
+      : process.env.PI_WORKFLOW_RUNNER === "pi-rust" || isPiRustAvailable()
+        ? "pi-rust"
+        : "in-process";
+  const workflowTool = createWorkflowTool({ stateStore, runner });
+  const subagentTool = createSubagentTool({ runner });
   pi.registerTool(workflowTool);
   pi.registerTool(subagentTool);
 

@@ -14,7 +14,12 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
-import { DEFAULT_WORKFLOW_MODEL_CATALOG, selectWorkflowModel, type WorkflowModelCatalog } from "./model-selection.js";
+import {
+  DEFAULT_WORKFLOW_MODEL_CATALOG,
+  selectWorkflowModel,
+  type WorkflowModelCatalog,
+  type WorkflowModelSelection,
+} from "./model-selection.js";
 import type {
   WorkflowAgentRunMetadata,
   WorkflowModelRef,
@@ -62,6 +67,65 @@ export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef 
   ? Static<TSchemaDef>
   : string;
 
+export interface ResolvedWorkflowAgentModel {
+  agentDir: string;
+  modelRegistry: ModelRegistry;
+  selected?: WorkflowModelSelection;
+  resolvedModel?: Model<any>;
+  thinkingLevel?: WorkflowThinkingLevel;
+}
+
+export function resolveWorkflowAgentModel(options: {
+  sessionOptions?: Partial<CreateAgentSessionOptions>;
+  modelCatalog?: WorkflowModelCatalog;
+  model?: WorkflowModelRef;
+  job?: string;
+  thinkingLevel?: WorkflowThinkingLevel;
+}): ResolvedWorkflowAgentModel {
+  const sessionOptions = options.sessionOptions ?? {};
+  const agentDir = getAgentDir();
+  const modelRegistry =
+    sessionOptions.modelRegistry ??
+    ModelRegistry.create(sessionOptions.authStorage ?? AuthStorage.create(join(agentDir, "auth.json")));
+  const selected =
+    !options.model && options.job
+      ? selectWorkflowModel(
+          options.modelCatalog ?? DEFAULT_WORKFLOW_MODEL_CATALOG,
+          options.job,
+          typeof modelRegistry.getAvailable === "function" ? modelRegistry.getAvailable() : modelRegistry.getAll(),
+        )
+      : undefined;
+  const resolvedModel = resolveWorkflowModel(modelRegistry, options.model ?? selected?.model);
+  const thinkingLevel = options.thinkingLevel ?? selected?.thinkingLevel;
+  return { agentDir, modelRegistry, selected, resolvedModel, thinkingLevel };
+}
+
+export const STRUCTURED_OUTPUT_TOOL_CONTRACT = [
+  "Final output contract:",
+  "- Your final action MUST be a structured_output tool call.",
+  "- The structured_output arguments are the return value of this subagent.",
+  "- Do not emit a prose final answer instead of structured_output.",
+  "- If you need to inspect files or run commands first, do so, then call structured_output exactly once.",
+].join("\n");
+
+export function buildWorkflowAgentPrompt(
+  prompt: string,
+  options: Pick<AgentRunOptions<any>, "instructions" | "label">,
+  baseInstructions?: string,
+  finalContract?: string,
+): string {
+  const parts = [
+    baseInstructions,
+    options.instructions,
+    options.label ? `Task label: ${options.label}` : undefined,
+    prompt,
+  ].filter(Boolean);
+
+  if (finalContract) parts.push(finalContract);
+
+  return parts.join("\n\n");
+}
+
 export class WorkflowAgent {
   private readonly cwd: string;
   private readonly extraTools: ToolDefinition[];
@@ -82,20 +146,13 @@ export class WorkflowAgent {
     options: AgentRunOptions<TSchemaDef> = {},
   ): Promise<AgentRunResult<TSchemaDef>> {
     const capture: StructuredOutputCapture<any> = { called: false, value: undefined };
-    const agentDir = getAgentDir();
-    const modelRegistry =
-      this.sessionOptions.modelRegistry ??
-      ModelRegistry.create(this.sessionOptions.authStorage ?? AuthStorage.create(join(agentDir, "auth.json")));
-    const selected =
-      !options.model && options.job
-        ? selectWorkflowModel(
-            this.modelCatalog,
-            options.job,
-            typeof modelRegistry.getAvailable === "function" ? modelRegistry.getAvailable() : modelRegistry.getAll(),
-          )
-        : undefined;
-    const resolvedModel = resolveWorkflowModel(modelRegistry, options.model ?? selected?.model);
-    const thinkingLevel = options.thinkingLevel ?? selected?.thinkingLevel;
+    const { agentDir, modelRegistry, selected, resolvedModel, thinkingLevel } = resolveWorkflowAgentModel({
+      sessionOptions: this.sessionOptions,
+      modelCatalog: this.modelCatalog,
+      model: options.model,
+      job: options.job,
+      thinkingLevel: options.thinkingLevel,
+    });
     const metadata: WorkflowAgentRunMetadata = {
       cwd: this.cwd,
       model: resolvedModel ? { provider: resolvedModel.provider, id: resolvedModel.id } : undefined,
@@ -160,7 +217,14 @@ export class WorkflowAgent {
           if (Object.keys(update).length > 0) emitUpdate(update);
         });
 
-        await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
+        await session.prompt(
+          buildWorkflowAgentPrompt(
+            prompt,
+            options as AgentRunOptions<any>,
+            this.instructions,
+            options.schema ? STRUCTURED_OUTPUT_TOOL_CONTRACT : undefined,
+          ),
+        );
         if (options.signal?.aborted) throw createAbortError();
 
         if (options.schema) {
@@ -188,29 +252,6 @@ export class WorkflowAgent {
       emitUpdate();
       options.onMetadata?.(metadata);
     }
-  }
-
-  private buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string {
-    const parts = [
-      this.instructions,
-      options.instructions,
-      options.label ? `Task label: ${options.label}` : undefined,
-      prompt,
-    ].filter(Boolean);
-
-    if (structured) {
-      parts.push(
-        [
-          "Final output contract:",
-          "- Your final action MUST be a structured_output tool call.",
-          "- The structured_output arguments are the return value of this subagent.",
-          "- Do not emit a prose final answer instead of structured_output.",
-          "- If you need to inspect files or run commands first, do so, then call structured_output exactly once.",
-        ].join("\n"),
-      );
-    }
-
-    return parts.join("\n\n");
   }
 
   private lastAssistantText(messages: unknown[]): string {

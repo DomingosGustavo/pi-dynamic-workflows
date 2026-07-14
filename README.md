@@ -45,6 +45,12 @@ Task prompts must be self-contained: the subagent does not inherit the parent co
 
 With `tasks`, each entry may override `model`, `thinkingLevel`, and `label` (top-level values act as defaults). Tasks must be independent of each other; results come back as one labeled section per task, in task order, with failed tasks reported inline as `FAILED: <message>` (the call only rejects if every task fails).
 
+## pi-rust runner
+
+When the `pi-rust` CLI is available on `PATH`, the extension automatically runs subagents through `pi-rust -p --mode json` instead of the in-process Pi agent session. Override selection with `PI_WORKFLOW_RUNNER=in-process` or `PI_WORKFLOW_RUNNER=pi-rust`.
+
+Limitations: the pi-rust runner cannot load custom in-process tools supplied by embedders. Structured output still validates the requested schema, but uses a final-JSON contract in the agent's last assistant message instead of injecting the `structured_output` tool.
+
 ## Workflow Creator Skill
 
 This repo includes a Pi skill at `skills/pi-workflow-creator` for designing Pi workflow scripts. Invoke it as
